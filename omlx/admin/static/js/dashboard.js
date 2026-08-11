@@ -255,12 +255,23 @@
             },
             alltimeStats: {
                 total_prompt_tokens: 0,
+                total_completion_tokens: 0,
                 total_cached_tokens: 0,
                 cache_efficiency: 0.0,
                 avg_prefill_tps: 0.0,
                 avg_generation_tps: 0.0,
                 total_requests: 0,
             },
+            // Cost tracking data
+            costData: {
+                models: {},
+                session_total: { prompt_tokens: 0, completion_tokens: 0, prompt_cost: 0, completion_cost: 0, total_cost: 0 },
+                alltime_total: { prompt_tokens: 0, completion_tokens: 0, prompt_cost: 0, completion_cost: 0, total_cost: 0 },
+                default_pricing: { prompt_price_per_m: 0, completion_price_per_m: 0 },
+            },
+            modelPricing: {},
+            defaultPricing: { prompt_price_per_m: 0, completion_price_per_m: 0 },
+            costEditing: false,
             // Server connectivity info (from /admin/api/server-info)
             serverAliases: [],
             selectedAlias: '',
@@ -582,6 +593,7 @@
                     this.loadServerInfo(),
                     this.loadProfileFields(),
                     this.loadPresets(),
+                    this.loadPricing(),
                     this.checkForUpdate()
                 ]);
 
@@ -2625,6 +2637,8 @@
                 } catch (err) {
                     console.error('Failed to load stats:', err);
                 }
+                // Also load cost data alongside stats
+                this.loadCosts();
             },
 
             async clearStats() {
@@ -2647,6 +2661,103 @@
                     console.error('Failed to clear all-time stats:', err);
                     this.showClearAlltimeConfirm = false;
                 }
+            },
+
+            async loadCosts() {
+                try {
+                    const response = await fetch('/admin/api/stats/costs');
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.costData = { ...this.costData, ...data };
+                        this.defaultPricing = data.default_pricing || { prompt_price_per_m: 0, completion_price_per_m: 0 };
+                        this.modelPricing = data.models ? Object.fromEntries(
+                            Object.entries(data.models).map(([k, v]) => [k, v.pricing || {}])
+                        ) : {};
+                    }
+                } catch (err) {
+                    console.error('Failed to load costs:', err);
+                }
+            },
+
+            async loadPricing() {
+                try {
+                    const response = await fetch('/admin/api/pricing');
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.modelPricing = data.models || {};
+                        this.defaultPricing = {
+                            prompt_price_per_m: data.default_prompt_price_per_m || 0,
+                            completion_price_per_m: data.default_completion_price_per_m || 0,
+                        };
+                    }
+                } catch (err) {
+                    console.error('Failed to load pricing:', err);
+                }
+            },
+
+            get costModelList() {
+                // Merge loaded models + models with cost data + models with pricing
+                const seen = new Set();
+                const list = [];
+                for (const m of this.models) {
+                    if (m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type || m.model_type === 'embedding') {
+                        if (!seen.has(m.id)) { seen.add(m.id); list.push(m); }
+                    }
+                }
+                for (const modelId of Object.keys(this.costData.models || {})) {
+                    if (!seen.has(modelId)) { seen.add(modelId); list.push({ id: modelId }); }
+                }
+                for (const modelId of Object.keys(this.modelPricing || {})) {
+                    if (!seen.has(modelId)) { seen.add(modelId); list.push({ id: modelId }); }
+                }
+                return list;
+            },
+
+            getModelPriceIn(modelId) {
+                if (this.modelPricing[modelId]) return this.modelPricing[modelId].prompt_price_per_m || 0;
+                return this.defaultPricing.prompt_price_per_m || 0;
+            },
+
+            getModelPriceOut(modelId) {
+                if (this.modelPricing[modelId]) return this.modelPricing[modelId].completion_price_per_m || 0;
+                return this.defaultPricing.completion_price_per_m || 0;
+            },
+
+            formatCost(value) {
+                if (value === 0 || value === undefined || value === null) return '$0.00';
+                return value.toLocaleString(undefined, { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 4 });
+            },
+
+            _pricingSaveTimer: null,
+            setModelPrice(modelId, field, value) {
+                // Save a single model's pricing via PUT
+                const numVal = parseFloat(value) || 0;
+                const existing = this.modelPricing[modelId] || {};
+                const update = {
+                    prompt_price_per_m: field === 'prompt_price_per_m' ? numVal : (existing.prompt_price_per_m || 0),
+                    completion_price_per_m: field === 'completion_price_per_m' ? numVal : (existing.completion_price_per_m || 0),
+                };
+                if (existing.label) update.label = existing.label;
+
+                // Update local state immediately for responsiveness
+                this.modelPricing = { ...this.modelPricing, [modelId]: update };
+
+                // Debounce API call
+                clearTimeout(this._pricingSaveTimer);
+                this._pricingSaveTimer = setTimeout(async () => {
+                    try {
+                        const response = await fetch('/admin/api/pricing/models/' + encodeURIComponent(modelId), {
+                            method: 'PUT',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(update),
+                        });
+                        if (response.ok) {
+                            await this.loadCosts();
+                        }
+                    } catch (err) {
+                        console.error('Failed to save pricing for', modelId, err);
+                    }
+                }, 500);
             },
 
             async clearSsdCache() {

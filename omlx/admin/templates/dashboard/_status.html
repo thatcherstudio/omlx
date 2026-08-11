@@ -53,18 +53,26 @@
                         </div>
                     </div>
 
-                    <!-- Three Stat Cards -->
-                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 sm:gap-6 mb-8">
-                        <!-- Total Prefill Tokens -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
-                            <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.total_tokens') }}</p>
+                    <!-- Four Stat Cards -->
+                    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 sm:gap-6 mb-8">
+                        <!-- Tokens In -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-6 text-center">
+                            <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.prompt_tokens') }}</p>
                             <p class="font-bold tracking-tight text-neutral-900 transition-all"
                                :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_prompt_tokens)"
                                x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_prompt_tokens)"></p>
                         </div>
 
+                        <!-- Tokens Out -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-6 text-center">
+                            <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.completion_tokens') }}</p>
+                            <p class="font-bold tracking-tight text-neutral-900 transition-all"
+                               :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_completion_tokens)"
+                               x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_completion_tokens)"></p>
+                        </div>
+
                         <!-- Cached Tokens Served -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
+                        <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-6 text-center">
                             <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.cached_tokens') }}</p>
                             <p class="font-bold tracking-tight text-neutral-900 transition-all"
                                :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_cached_tokens)"
@@ -72,11 +80,98 @@
                         </div>
 
                         <!-- Cache Efficiency -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
+                        <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-6 text-center">
                             <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.cache_efficiency') }}</p>
                             <p class="font-bold tracking-tight text-neutral-900 transition-all"
                                :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).cache_efficiency)"
                                x-text="(statsScope === 'alltime' ? alltimeStats : stats).cache_efficiency.toFixed(1) + '%'"></p>
+                        </div>
+                    </div>
+
+                    <!-- Cost Tracking -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="dollar-sign" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.cost.section_label') }}</span>
+                            </div>
+                            <button @click="costEditing = !costEditing"
+                                    :class="costEditing ? 'bg-neutral-900 text-white' : 'text-neutral-500 hover:text-neutral-700 hover:bg-neutral-200'"
+                                    class="px-3 py-1.5 text-xs font-medium rounded-lg transition-all flex items-center gap-1.5">
+                                <i data-lucide="pencil" class="w-3.5 h-3.5"></i>
+                                <span x-text="costEditing ? 'Done' : 'Edit Prices'"></span>
+                            </button>
+                        </div>
+
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-sm">
+                                <thead>
+                                    <tr class="border-b border-neutral-200 bg-neutral-50 text-xs text-neutral-500 uppercase tracking-wider">
+                                        <th class="text-left px-4 py-3 font-semibold">Model</th>
+                                        <th class="text-right px-3 py-3 font-semibold">$IN/1M</th>
+                                        <th class="text-right px-3 py-3 font-semibold">$OUT/1M</th>
+                                        <th class="text-right px-3 py-3 font-semibold">Cost IN</th>
+                                        <th class="text-right px-3 py-3 font-semibold">Cost OUT</th>
+                                        <th class="text-right px-4 py-3 font-semibold">Total</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-neutral-100">
+                                    <template x-for="m in costModelList" :key="m.id">
+                                        <tr class="hover:bg-neutral-50">
+                                            <td class="px-4 py-3 font-medium text-neutral-800 break-all text-xs" x-text="m.id"></td>
+                                            <!-- Edit mode: inputs -->
+                                            <template x-if="costEditing">
+                                                <td class="px-3 py-3 text-right">
+                                                    <div class="relative inline-block">
+                                                        <span class="absolute inset-y-0 left-1.5 flex items-center text-neutral-400 text-xs">$</span>
+                                                        <input type="number" step="0.01" min="0"
+                                                               :value="getModelPriceIn(m.id)"
+                                                               @change="setModelPrice(m.id, 'prompt_price_per_m', $event.target.value)"
+                                                               class="w-20 pl-4 pr-1 py-1 text-xs text-right border border-amber-300 rounded focus:ring-1 focus:ring-amber-500 focus:border-amber-500 bg-amber-50">
+                                                    </div>
+                                                </td>
+                                            </template>
+                                            <template x-if="costEditing">
+                                                <td class="px-3 py-3 text-right">
+                                                    <div class="relative inline-block">
+                                                        <span class="absolute inset-y-0 left-1.5 flex items-center text-neutral-400 text-xs">$</span>
+                                                        <input type="number" step="0.01" min="0"
+                                                               :value="getModelPriceOut(m.id)"
+                                                               @change="setModelPrice(m.id, 'completion_price_per_m', $event.target.value)"
+                                                               class="w-20 pl-4 pr-1 py-1 text-xs text-right border border-amber-300 rounded focus:ring-1 focus:ring-amber-500 focus:border-amber-500 bg-amber-50">
+                                                    </div>
+                                                </td>
+                                            </template>
+                                            <!-- Read mode: plain text -->
+                                            <template x-if="!costEditing">
+                                                <td class="px-3 py-3 text-right text-xs text-neutral-600"
+                                                    x-text="formatCost(getModelPriceIn(m.id)) + '/M'"></td>
+                                            </template>
+                                            <template x-if="!costEditing">
+                                                <td class="px-3 py-3 text-right text-xs text-neutral-600"
+                                                    x-text="formatCost(getModelPriceOut(m.id)) + '/M'"></td>
+                                            </template>
+                                            <td class="px-3 py-3 text-right text-xs text-neutral-600"
+                                                x-text="formatCost(statsScope === 'alltime' ? (costData.models[m.id]?.alltime?.prompt_cost ?? 0) : (costData.models[m.id]?.session?.prompt_cost ?? 0))"></td>
+                                            <td class="px-3 py-3 text-right text-xs text-neutral-600"
+                                                x-text="formatCost(statsScope === 'alltime' ? (costData.models[m.id]?.alltime?.completion_cost ?? 0) : (costData.models[m.id]?.session?.completion_cost ?? 0))"></td>
+                                            <td class="px-4 py-3 text-right text-xs font-bold text-neutral-900"
+                                                x-text="formatCost(statsScope === 'alltime' ? (costData.models[m.id]?.alltime?.total_cost ?? 0) : (costData.models[m.id]?.session?.total_cost ?? 0))"></td>
+                                        </tr>
+                                    </template>
+                                </tbody>
+                                <tfoot>
+                                    <tr class="bg-neutral-50 border-t-2 border-neutral-200">
+                                        <td class="px-4 py-3 font-bold text-neutral-800" colspan="3">Total</td>
+                                        <td class="px-3 py-3 text-right text-xs font-semibold text-neutral-600"
+                                            x-text="formatCost(statsScope === 'alltime' ? (costData.alltime_total?.prompt_cost ?? 0) : (costData.session_total?.prompt_cost ?? 0))"></td>
+                                        <td class="px-3 py-3 text-right text-xs font-semibold text-neutral-600"
+                                            x-text="formatCost(statsScope === 'alltime' ? (costData.alltime_total?.completion_cost ?? 0) : (costData.session_total?.completion_cost ?? 0))"></td>
+                                        <td class="px-4 py-3 text-right font-bold text-neutral-900"
+                                            x-text="formatCost(statsScope === 'alltime' ? (costData.alltime_total?.total_cost ?? 0) : (costData.session_total?.total_cost ?? 0))"></td>
+                                    </tr>
+                                </tfoot>
+                            </table>
                         </div>
                     </div>
 

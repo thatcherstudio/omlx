@@ -4871,6 +4871,159 @@ async def clear_alltime_stats(is_admin: bool = Depends(require_admin)):
     return {"status": "ok"}
 
 
+# =============================================================================
+# Model Pricing API
+# =============================================================================
+
+
+class PricingUpdateRequest(BaseModel):
+    """Request body for updating model pricing."""
+    models: dict[str, Any] = {}
+    default_prompt_price_per_m: float = 0.0
+    default_completion_price_per_m: float = 0.0
+
+
+class ModelPricingUpdateRequest(BaseModel):
+    """Request body for updating a single model's pricing."""
+    prompt_price_per_m: float | None = None
+    completion_price_per_m: float | None = None
+    label: str | None = None
+
+
+@router.get("/api/pricing")
+async def get_pricing(is_admin: bool = Depends(require_admin)):
+    """Get all model pricing data."""
+    from ..model_pricing import get_model_pricing
+
+    pricing = get_model_pricing()
+    return pricing.get_all_pricing()
+
+
+@router.post("/api/pricing")
+async def update_pricing(
+    request: PricingUpdateRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Update full pricing configuration."""
+    from ..model_pricing import get_model_pricing
+
+    pricing = get_model_pricing()
+    pricing.update_pricing(request.model_dump())
+    return pricing.get_all_pricing()
+
+
+@router.put("/api/pricing/models/{model_id}")
+async def update_model_pricing(
+    model_id: str,
+    request: ModelPricingUpdateRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Update pricing for a specific model."""
+    from ..model_pricing import get_model_pricing
+
+    pricing = get_model_pricing()
+    result = pricing.update_model_pricing(
+        model_id=model_id,
+        prompt_price_per_m=request.prompt_price_per_m,
+        completion_price_per_m=request.completion_price_per_m,
+        label=request.label,
+    )
+    return {"model_id": model_id, **result}
+
+
+@router.delete("/api/pricing/models/{model_id}")
+async def delete_model_pricing(
+    model_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Delete pricing for a specific model."""
+    from ..model_pricing import get_model_pricing
+
+    pricing = get_model_pricing()
+    data = pricing.get_all_pricing()
+    if model_id in data["models"]:
+        del data["models"][model_id]
+        pricing.update_pricing(data)
+    return pricing.get_all_pricing()
+
+
+@router.get("/api/stats/costs")
+async def get_server_costs(
+    scope: str = "session",
+    is_admin: bool = Depends(require_admin),
+):
+    """Get cost calculations for all models based on token usage and pricing."""
+    from ..server_metrics import get_server_metrics
+    from ..model_pricing import get_model_pricing
+
+    metrics = get_server_metrics()
+    pricing = get_model_pricing()
+
+    # Get session and alltime snapshots
+    session_snap = metrics.get_snapshot(scope="session")
+    alltime_snap = metrics.get_snapshot(scope="alltime")
+
+    # Get all known model IDs from both session and alltime
+    all_models = set(metrics._per_model.keys()) | set(metrics._alltime_per_model.keys())
+
+    model_costs = {}
+    for model_id in all_models:
+        s = metrics.get_snapshot(model_id=model_id, scope="session")
+        a = metrics.get_snapshot(model_id=model_id, scope="alltime")
+        p = pricing.get_model_pricing(model_id)
+
+        s_cost = pricing.calculate_cost(model_id, s["total_prompt_tokens"], s["total_completion_tokens"])
+        a_cost = pricing.calculate_cost(model_id, a["total_prompt_tokens"], a["total_completion_tokens"])
+
+        model_costs[model_id] = {
+            "session": {
+                "prompt_tokens": s["total_prompt_tokens"],
+                "completion_tokens": s["total_completion_tokens"],
+                "prompt_cost": s_cost["prompt_cost"],
+                "completion_cost": s_cost["completion_cost"],
+                "total_cost": s_cost["total_cost"],
+            },
+            "alltime": {
+                "prompt_tokens": a["total_prompt_tokens"],
+                "completion_tokens": a["total_completion_tokens"],
+                "prompt_cost": a_cost["prompt_cost"],
+                "completion_cost": a_cost["completion_cost"],
+                "total_cost": a_cost["total_cost"],
+            },
+            "pricing": p,
+        }
+
+    # Global totals — sum individual model costs (each uses its own pricing)
+    session_total_prompt_cost = sum(c["session"]["prompt_cost"] for c in model_costs.values())
+    session_total_completion_cost = sum(c["session"]["completion_cost"] for c in model_costs.values())
+    session_total_cost = sum(c["session"]["total_cost"] for c in model_costs.values())
+    alltime_total_prompt_cost = sum(c["alltime"]["prompt_cost"] for c in model_costs.values())
+    alltime_total_completion_cost = sum(c["alltime"]["completion_cost"] for c in model_costs.values())
+    alltime_total_cost = sum(c["alltime"]["total_cost"] for c in model_costs.values())
+
+    return {
+        "models": model_costs,
+        "session_total": {
+            "prompt_tokens": session_snap["total_prompt_tokens"],
+            "completion_tokens": session_snap["total_completion_tokens"],
+            "prompt_cost": round(session_total_prompt_cost, 6),
+            "completion_cost": round(session_total_completion_cost, 6),
+            "total_cost": round(session_total_cost, 6),
+        },
+        "alltime_total": {
+            "prompt_tokens": alltime_snap["total_prompt_tokens"],
+            "completion_tokens": alltime_snap["total_completion_tokens"],
+            "prompt_cost": round(alltime_total_prompt_cost, 6),
+            "completion_cost": round(alltime_total_completion_cost, 6),
+            "total_cost": round(alltime_total_cost, 6),
+        },
+        "default_pricing": {
+            "prompt_price_per_m": pricing._default_prompt,
+            "completion_price_per_m": pricing._default_completion,
+        },
+    }
+
+
 def _iter_loaded_scheduler_records():
     """Yield (model_id, scheduler, core) for each loaded model.
 
