@@ -91,6 +91,7 @@
   "status.cost.section_label": "費用追蹤",
   "status.cost.configure": "設定定價",
   "status.cost.no_pricing": "設定每1M令牌的價格以查看費用估算。",
+  "status.cost.no_usage": "此範圍內沒有模型使用紀錄。",
   "status.cost.in_cost": "輸入費用",
   "status.cost.out_cost": "輸出費用",
   "status.cost.in_tokens": "輸入 Token",

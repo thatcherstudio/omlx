@@ -547,6 +547,7 @@
             showClearSsdCacheConfirm: false,
             showClearHotCacheConfirm: false,
             _statsRefreshTimer: null,
+            _costRefreshTimer: null,
 
             // Log viewer state
             logContent: '',
@@ -9057,22 +9058,20 @@
                 }
             },
 
+            costModelsForScope(scope) {
+                const usageScope = scope === 'alltime' ? 'alltime' : 'session';
+                return Object.entries(this.costData.models || {})
+                    .filter(([, model]) => {
+                        const usage = model?.[usageScope] || {};
+                        return Number(usage.prompt_tokens || 0) > 0
+                            || Number(usage.completion_tokens || 0) > 0;
+                    })
+                    .map(([id]) => ({ id }))
+                    .sort((a, b) => a.id.localeCompare(b.id));
+            },
+
             get costModelList() {
-                // Merge loaded models + models with cost data + models with pricing
-                const seen = new Set();
-                const list = [];
-                for (const m of this.models) {
-                    if (m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type || m.model_type === 'embedding') {
-                        if (!seen.has(m.id)) { seen.add(m.id); list.push(m); }
-                    }
-                }
-                for (const modelId of Object.keys(this.costData.models || {})) {
-                    if (!seen.has(modelId)) { seen.add(modelId); list.push({ id: modelId }); }
-                }
-                for (const modelId of Object.keys(this.modelPricing || {})) {
-                    if (!seen.has(modelId)) { seen.add(modelId); list.push({ id: modelId }); }
-                }
-                return list;
+                return this.costModelsForScope(this.statsScope);
             },
 
             getModelPriceIn(modelId) {
@@ -9152,12 +9151,19 @@
                 this._statsRefreshTimer = setInterval(() => {
                     this.loadStats(false);
                 }, 500);
+                this._costRefreshTimer = setInterval(() => {
+                    this.loadCosts();
+                }, 3000);
             },
 
             stopStatsRefresh() {
                 if (this._statsRefreshTimer) {
                     clearInterval(this._statsRefreshTimer);
                     this._statsRefreshTimer = null;
+                }
+                if (this._costRefreshTimer) {
+                    clearInterval(this._costRefreshTimer);
+                    this._costRefreshTimer = null;
                 }
             },
 

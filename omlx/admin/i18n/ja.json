@@ -91,6 +91,7 @@
   "status.cost.section_label": "コスト追跡",
   "status.cost.configure": "料金設定",
   "status.cost.no_pricing": "1Mトークンあたりの料金を設定するとコスト見積もりが表示されます。",
+  "status.cost.no_usage": "この範囲にはモデルの使用履歴がありません。",
   "status.cost.in_cost": "入力コスト",
   "status.cost.out_cost": "出力コスト",
   "status.cost.in_tokens": "入力トークン",

@@ -91,6 +91,7 @@
   "status.cost.section_label": "费用追踪",
   "status.cost.configure": "配置定价",
   "status.cost.no_pricing": "设置每1M令牌的价格以查看费用估算。",
+  "status.cost.no_usage": "此范围内没有模型使用记录。",
   "status.cost.in_cost": "输入费用",
   "status.cost.out_cost": "输出费用",
   "status.cost.in_tokens": "输入 Token",

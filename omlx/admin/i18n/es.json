@@ -91,6 +91,7 @@
   "status.cost.section_label": "Seguimiento de Costos",
   "status.cost.configure": "Configurar Precios",
   "status.cost.no_pricing": "Configure el precio por 1M de tokens para ver las estimaciones de costos.",
+  "status.cost.no_usage": "No hay uso de modelos en este periodo.",
   "status.cost.in_cost": "Costo de Entrada",
   "status.cost.out_cost": "Costo de Salida",
   "status.cost.in_tokens": "Tokens In",

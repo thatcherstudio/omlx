@@ -91,6 +91,7 @@
   "status.cost.section_label": "Отслеживание расходов",
   "status.cost.configure": "Настроить цены",
   "status.cost.no_pricing": "Укажите цену за 1M токенов для отображения оценки расходов.",
+  "status.cost.no_usage": "Нет данных об использовании моделей за этот период.",
   "status.cost.in_cost": "Стоимость ввода",
   "status.cost.out_cost": "Стоимость вывода",
   "status.cost.in_tokens": "Входные токены",

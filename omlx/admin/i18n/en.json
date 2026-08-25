@@ -91,6 +91,7 @@
   "status.cost.section_label": "Cost Tracking",
   "status.cost.configure": "Configure Pricing",
   "status.cost.no_pricing": "Set pricing per 1M tokens to see cost estimates. Click Configure Pricing to get started.",
+  "status.cost.no_usage": "No model usage for this scope.",
   "status.cost.in_cost": "Input Cost",
   "status.cost.out_cost": "Output Cost",
   "status.cost.in_tokens": "Tokens In",

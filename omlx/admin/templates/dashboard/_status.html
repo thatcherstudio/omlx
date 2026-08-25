@@ -116,6 +116,11 @@
                                     </tr>
                                 </thead>
                                 <tbody class="divide-y divide-neutral-100">
+                                    <tr x-show="costModelList.length === 0" x-cloak>
+                                        <td colspan="6" class="px-4 py-8 text-center text-sm text-neutral-500">
+                                            {{ t('status.cost.no_usage') }}
+                                        </td>
+                                    </tr>
                                     <template x-for="m in costModelList" :key="m.id">
                                         <tr class="hover:bg-neutral-50">
                                             <td class="px-4 py-3 font-medium text-neutral-800 break-all text-xs" x-text="m.id"></td>
