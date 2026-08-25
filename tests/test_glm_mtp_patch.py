@@ -64,6 +64,17 @@ TINY_CFG = dict(
 )
 
 
+@pytest.fixture()
+def strict_math_device():
+    """Use deterministic CPU reductions for sub-ulp algebraic parity tests."""
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        yield
+    finally:
+        mx.set_default_device(previous)
+
+
 def _raw_hf_weights(glm, model):
     """Rebuild a raw-HF-layout weights dict from a built model's params.
 
@@ -520,7 +531,9 @@ class TestForward:
 
 
 class TestSmallLRouting:
-    def test_absorbed_matches_materialized(self, glm, mtp_active):
+    def test_absorbed_matches_materialized(
+        self, glm, mtp_active, strict_math_device
+    ):
         """The widened L<=8 absorbed path equals the legacy materialize path."""
         import omlx.patches.glm_moe_dsa.glm_moe_dsa_model as gm
         from mlx_lm.models.base import create_attention_mask
@@ -555,7 +568,9 @@ class TestSmallLRouting:
             diff = float(mx.abs(legacy - absorbed).max())
             assert diff < 2e-5, f"L={L}: {diff}"
 
-    def test_topk_gather_matches_masked_reference(self, glm, mtp_active):
+    def test_topk_gather_matches_masked_reference(
+        self, glm, mtp_active, strict_math_device
+    ):
         """With the DSA indexer active (K > index_topk), the decode-shape
         per-row gather path must equal the legacy masked full-K path."""
         import omlx.patches.glm_moe_dsa.glm_moe_dsa_model as gm

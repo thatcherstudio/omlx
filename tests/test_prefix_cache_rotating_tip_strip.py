@@ -235,6 +235,50 @@ def test_grandparent_tip_stripped_prev_tip_kept(tmp_path):
     assert _rotating_layer_shape(ssd, tip4) == REAL_ROTATING_SHAPE
 
 
+def test_diverged_store_does_not_track_branch_block_as_tip(tmp_path):
+    """A store that diverged from an existing chain reuses shared-prefix
+    blocks; the last reused block is NOT a superseded tip and must not
+    enter the lineage (it would be stripped two stores later, permanently
+    breaking partial-match walk-back restores on the shared prefix)."""
+    cache, ssd = _make_cache(tmp_path)
+
+    t1 = _store_turn(cache, 1, num_blocks=2)
+    tip1 = _block_hash(cache, t1, -1)
+    _store_turn(cache, 2, num_blocks=3)
+
+    # Diverged chain: shares only block 0 with the existing chain.
+    tokens_b = list(range(BLOCK_SIZE)) + [1000 + i for i in range(2 * BLOCK_SIZE)]
+    tb = cache.store_cache(
+        "branch-1", tokens_b, _hybrid_cache_data(seq_len=len(tokens_b))
+    )
+    assert tb is not None and len(tb.block_ids) == 3
+    tip_b1 = _block_hash(cache, tb, -1)
+
+    # The branch store must not record a lineage entry: its predecessor
+    # block is a shared interior block, not a superseded tip.
+    assert tip_b1 not in cache._rotating_tip_lineage
+
+    # Extending the branch chain twice still strips the branch chain's own
+    # former tip (normal supersede-on-extend behavior resumes).
+    tokens_b2 = tokens_b + [2000 + i for i in range(BLOCK_SIZE)]
+    tb2 = cache.store_cache(
+        "branch-2", tokens_b2, _hybrid_cache_data(seq_len=len(tokens_b2))
+    )
+    assert tb2 is not None
+    tip_b2 = _block_hash(cache, tb2, -1)
+    assert cache._rotating_tip_lineage.get(tip_b2) == tip_b1
+
+    tokens_b3 = tokens_b2 + [3000 + i for i in range(BLOCK_SIZE)]
+    tb3 = cache.store_cache(
+        "branch-3", tokens_b3, _hybrid_cache_data(seq_len=len(tokens_b3))
+    )
+    assert tb3 is not None
+    assert _rotating_layer_shape(ssd, tip_b1) == PLACEHOLDER_SHAPE
+
+    # The original chain's previous tip is untouched by branch activity.
+    assert _rotating_layer_shape(ssd, tip1) == REAL_ROTATING_SHAPE
+
+
 def test_stripped_block_keeps_sliceable_layers(tmp_path):
     """Only the rotating layer is stripped; the KVCache slice survives,
     and the stripped layer reads back as a standard placeholder."""

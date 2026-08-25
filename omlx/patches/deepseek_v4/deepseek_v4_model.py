@@ -2,6 +2,7 @@
 
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from functools import lru_cache, partial
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -11,26 +12,32 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from mlx.utils import tree_flatten
 
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import CacheList, PoolingCache, RotatingKVCache
-from .hyper_connection import HyperConnection, HyperHead, hc_expand
-from .mla import MultiLinear
-from .pipeline import PipelineMixin
-from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
-from omlx.patches.deepseek_v4.wsdpa_attention import wsdpa_prefill, wsdpa_topk_prefill
 from omlx.patches.deepseek_v4.decode_consistency import (
     is_armed as is_dspark_verify_armed,
 )
 from omlx.patches.deepseek_v4.decode_consistency import matmul as decode_matmul
+from omlx.patches.deepseek_v4.indexer_dispatch import (
+    disable_native_indexer,
+    native_indexer_available,
+    native_indexer_disabled,
+    native_indexer_shape_eligible,
+)
+from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
 from omlx.patches.deepseek_v4.verify_attention import (
     exact_attention,
     exact_local_scores,
     exact_local_values,
     rowwise_gemm,
 )
+from omlx.patches.deepseek_v4.wsdpa_attention import wsdpa_prefill, wsdpa_topk_prefill
+
+from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import CacheList, PoolingCache, RotatingKVCache
+from .hyper_connection import HyperConnection, HyperHead, hc_expand
+from .mla import MultiLinear
+from .pipeline import PipelineMixin
 
 _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = False
-_DEEPSEEK_V4_INDEXER_NATIVE_DISABLED = False
 _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED = False
 
 
@@ -469,14 +476,62 @@ def _overlap_compress_kv(kv, gate, ape, head_dim):
 # intermediate is (1, 64, 512, ctx/4) fp32 — 8.3 GiB at 273k context, read
 # five more times. Worse, 64*512*P crosses 2**31 elements at ctx = 256k, the
 # boundary where mlx's int32 kernel indexing silently zeros the tail and
-# corrupts top-k selection. Tiling the pooled axis bounds the live
-# intermediate at 64*512*TILE and keeps every matmul under 2**31.
+# corrupts top-k selection. Tiling keeps each matmul under 2**31 elements;
+# the memory estimator separately accounts for lazy evaluation retaining
+# multiple score shards at once.
 _INDEXER_POOL_TILE = 16384
 # mlx kernels index with int32, so a tensor at or past 2**31 elements has its
 # tail silently zeroed. Stay a factor of 2 below that. For a 512-token chunk
 # with 64 index heads this is reached at P = ctx/4 ~= 32768, i.e. ctx ~= 128k.
 _INDEXER_MAX_ELEMS = 2**30
 _DEEPSEEK_V4_INDEXER_FALLBACK_WARNED = False
+_DEEPSEEK_V4_M2_MMA_SCORE = os.getenv(
+    "OMLX_DSV4F_M2_MMA_SCORE", "1"
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_M2_MMA_SCORE_LOGGED = False
+
+
+def _dsv4f_m2_exact_pairing(config, compress_ratio: int) -> bool:
+    """True only for the exact DeepSeek-V4-Flash / Apple M2 Ultra pairing.
+
+    The v25 MMA indexer score kernel is benchmark-proven (and bit-exact
+    validated) on precisely this checkpoint/hardware combination; every
+    other pairing keeps the Steel kernel.
+    """
+    if compress_ratio != 4:
+        return False
+    try:
+        if mx.device_info().get("device_name") != "Apple M2 Ultra":
+            return False
+    except Exception:
+        return False
+    return (
+        config.model_type == "deepseek_v4"
+        and config.vocab_size == 129280
+        and config.hidden_size == 4096
+        and config.moe_intermediate_size == 2048
+        and config.num_hidden_layers == 43
+        and config.num_attention_heads == 64
+        and config.n_routed_experts == 256
+        and config.num_experts_per_tok == 6
+        and config.max_position_embeddings == 1048576
+        and config.index_n_heads == 64
+        and config.index_head_dim == 128
+        and config.index_topk == 512
+    )
+
+
+def _dsv4f_m2_mma_score_enabled(config, compress_ratio: int) -> bool:
+    """Gate for the v25 from-scratch MMA score kernel (1.37x over Steel).
+
+    Exact-fingerprint pairing, env rollback (OMLX_DSV4F_M2_MMA_SCORE=0),
+    and an extension build exposing the symbol. The kernel serves bf16 /
+    H=64 / D=128 / weights [B, L, H] / non-causal only — all guaranteed by
+    the fingerprint and this call site; N >= 64 is re-checked per call.
+    """
+    if not _DEEPSEEK_V4_M2_MMA_SCORE:
+        return False
+    return _dsv4f_m2_exact_pairing(config, compress_ratio)
 
 
 @partial(mx.compile, shapeless=True)
@@ -619,8 +674,13 @@ def _native_sparse_attention_available() -> bool:
         from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 
         return glm_fast.has_symbol("deepseek_v4_sparse_attention")
-    except Exception:
+    except Exception as exc:
         _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
+        logging.getLogger(__name__).warning(
+            "DSV4 native sparse attention unavailable; MLX fallback for "
+            "the rest of this process: %s",
+            exc,
+        )
         return False
 
 
@@ -644,8 +704,7 @@ def _sparse_pooled_attention(
 
     B, H, L, D = q.shape
     if (
-        not _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED
-        and q_offset is not None
+        q_offset is not None
         and compress_ratio is not None
         and local_window is not None
         and sinks is not None
@@ -677,23 +736,30 @@ def _sparse_pooled_attention(
             )
             if out is not None:
                 return out
-        try:
-            from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+        if not _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED:
+            try:
+                from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 
-            if glm_fast.has_symbol("deepseek_v4_sparse_attention"):
-                return glm_fast.deepseek_v4_sparse_attention(
-                    q,
-                    local_kv,
-                    pooled,
-                    topk[:, None],
-                    sinks,
-                    scale,
-                    int(q_offset),
-                    int(compress_ratio),
-                    int(local_window),
+                if glm_fast.has_symbol("deepseek_v4_sparse_attention"):
+                    return glm_fast.deepseek_v4_sparse_attention(
+                        q,
+                        local_kv,
+                        pooled,
+                        topk[:, None],
+                        sinks,
+                        scale,
+                        int(q_offset),
+                        int(compress_ratio),
+                        int(local_window),
+                    )
+            except Exception as exc:
+                _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
+                logging.getLogger(__name__).warning(
+                    "DSV4 native sparse attention kernel failed; MLX fallback "
+                    "for the rest of this process: %s",
+                    exc,
+                    exc_info=True,
                 )
-        except Exception:
-            _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
 
     if native_only:
         return None
@@ -1187,6 +1253,9 @@ class Indexer(nn.Module):
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
         self.compressor = Compressor(config, compress_ratio, self.head_dim)
         self.scale = self.head_dim**-0.5
+        self._m2_mma_score = _dsv4f_m2_mma_score_enabled(
+            config, compress_ratio
+        )
 
     def __call__(
         self,
@@ -1199,8 +1268,6 @@ class Indexer(nn.Module):
         projected_q: Optional[mx.array] = None,
         projected_weights: Optional[mx.array] = None,
     ):
-        global _DEEPSEEK_V4_INDEXER_NATIVE_DISABLED
-
         B, L, _ = x.shape
         if compressor_projection is None:
             pooled = self.compressor(x, pool_cache, offset)
@@ -1223,24 +1290,19 @@ class Indexer(nn.Module):
         pmask = pool_cache.make_mask(L, offset) if pool_cache is not None else None
         k = min(self.index_topk, pooled.shape[1])
 
-        if (
-            not _DEEPSEEK_V4_INDEXER_NATIVE_DISABLED
-            and pooled.shape[1] > self.index_topk
-            and k == self.index_topk
-            and L > 1
-            and L % 64 == 0
-            and pooled.shape[1] % 64 == 0
-            and self.n_heads in (32, 64)
-            and self.head_dim == 128
-            and q.dtype in (mx.float16, mx.bfloat16)
+        if native_indexer_shape_eligible(
+            query_tokens=L,
+            pooled_tokens=pooled.shape[1],
+            n_heads=self.n_heads,
+            head_dim=self.head_dim,
+            index_topk=self.index_topk,
+            dtype_supported=q.dtype in (mx.float16, mx.bfloat16),
         ):
             try:
                 from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 
-                _have_native = glm_fast.has_symbol(
-                    "dsa_indexer_scores"
-                ) and glm_fast.has_symbol("dsa_topk_indices")
-                if not _have_native:
+                _have_native = native_indexer_available()
+                if not _have_native and not native_indexer_disabled():
                     # Warn only when the kernels are genuinely missing -- the
                     # shape predicates above legitimately skip small/early
                     # chunks, so warning outside this branch cries wolf. The
@@ -1278,14 +1340,44 @@ class Indexer(nn.Module):
                     ):
                         _mask_ratio = int(pool_cache.ratio)
                         _mask_q_offset = int(offset)
-                    scores4 = glm_fast.dsa_indexer_scores(
-                        q,
-                        pooled[:, None],
-                        weights,
-                        causal=False,
-                        mask_ratio=_mask_ratio,
-                        mask_q_offset=_mask_q_offset,
+                    # v25 from-scratch MMA score kernel: 1.37x over Steel
+                    # on the exact M2/DSV4F pairing, bit-exact incl. the
+                    # fused pooled-ratio mask (validated across aligned and
+                    # unaligned M/N and chunked-prefill offsets). Gated by
+                    # fingerprint + OMLX_DSV4F_M2_MMA_SCORE + extension
+                    # symbol; every other configuration keeps the Steel
+                    # path below unchanged.
+                    _use_mma = (
+                        self._m2_mma_score
+                        and getattr(glm_fast, "_EXT_MMA_SCORE", False)
+                        and q.dtype == mx.bfloat16
+                        and pooled.shape[1] >= 64
                     )
+                    global _DEEPSEEK_V4_M2_MMA_SCORE_LOGGED
+                    if _use_mma and not _DEEPSEEK_V4_M2_MMA_SCORE_LOGGED:
+                        _DEEPSEEK_V4_M2_MMA_SCORE_LOGGED = True
+                        logging.getLogger(__name__).info(
+                            "deepseek_v4: DSV4F/M2 v25 MMA indexer score "
+                            "kernel active (zero-per-head-barrier, "
+                            "1.37x over Steel)"
+                        )
+                    if _use_mma:
+                        scores4 = glm_fast.dsa_indexer_scores_mma(
+                            q,
+                            pooled[:, None],
+                            weights,
+                            mask_ratio=_mask_ratio,
+                            mask_q_offset=_mask_q_offset,
+                        )
+                    else:
+                        scores4 = glm_fast.dsa_indexer_scores(
+                            q,
+                            pooled[:, None],
+                            weights,
+                            causal=False,
+                            mask_ratio=_mask_ratio,
+                            mask_q_offset=_mask_q_offset,
+                        )
                     if _mask_ratio == 0 and pmask is not None:
                         scores4 = mx.where(
                             (pmask[:, None] if pmask.ndim == 3 else pmask[None, None]),
@@ -1303,8 +1395,14 @@ class Indexer(nn.Module):
                         bucketed=False,
                     )[:, 0]
                     return mx.sort(indices, axis=-1)
-            except Exception:
-                _DEEPSEEK_V4_INDEXER_NATIVE_DISABLED = True
+            except Exception as exc:
+                disable_native_indexer()
+                logging.getLogger(__name__).warning(
+                    "DSV4 native indexer top-k failed; MLX fallback "
+                    "(slower prefill) for the rest of this process: %s",
+                    exc,
+                    exc_info=True,
+                )
 
         weights = (
             self.weights_proj(x) if projected_weights is None else projected_weights
@@ -1398,8 +1496,14 @@ def _batch_indexer_rows(
                         scores,
                         indexer.index_topk,
                     )
-            except Exception:
+            except Exception as exc:
                 _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED = True
+                logging.getLogger(__name__).warning(
+                    "DSV4 native DSpark top-k failed; stable-sort fallback "
+                    "for the rest of this process: %s",
+                    exc,
+                    exc_info=True,
+                )
         if indices is None:
             indices = _stable_topk_indices(scores, indexer.index_topk)
         indices = indices[:, None]
@@ -1449,8 +1553,14 @@ def _batch_indexer_rows(
 
                 if fast.has_symbol("dspark_fp32_topk_indices"):
                     indices = fast.dspark_fp32_topk_indices(scores, k)
-            except Exception:
+            except Exception as exc:
                 _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED = True
+                logging.getLogger(__name__).warning(
+                    "DSV4 native DSpark top-k failed; stable-sort fallback "
+                    "for the rest of this process: %s",
+                    exc,
+                    exc_info=True,
+                )
         if indices is None:
             indices = _stable_topk_indices(scores, k)
         indices = indices[:, None]
@@ -2276,7 +2386,7 @@ class Model(nn.Module):
                 ("w2", "down_proj"),
                 ("w3", "up_proj"),
             ):
-                for suffix in ("weight", "scales"):
+                for suffix in ("weight", "scales", "biases"):
                     key0 = f"{prefix}.0.{src}.{suffix}"
                     if key0 in weights:
                         stacked = [

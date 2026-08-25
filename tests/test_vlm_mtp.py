@@ -18,6 +18,41 @@ import pytest
 from omlx.speculative import vlm_mtp
 
 
+def test_qwen38_block_fp8_dequantization():
+    from omlx.patches.mlx_vlm_mtp.qwen38_fp8 import dequantize_fp8_weights
+
+    weight_key = "model.language_model.layers.0.self_attn.q_proj.weight"
+    weights = {
+        weight_key: mx.to_fp8(mx.ones((130, 129), dtype=mx.float32)),
+        f"{weight_key}_scale_inv": mx.array(
+            [[0.5, 1.0], [2.0, 4.0]], dtype=mx.bfloat16
+        ),
+    }
+
+    out = dequantize_fp8_weights(weights)
+    expected = mx.ones((130, 129), dtype=mx.bfloat16)
+    expected[:128, :128] *= 0.5
+    expected[:128, 128:] *= 1.0
+    expected[128:, :128] *= 2.0
+    expected[128:, 128:] *= 4.0
+
+    assert not any(key.endswith("weight_scale_inv") for key in out)
+    assert out[weight_key].dtype == mx.bfloat16
+    assert mx.array_equal(out[weight_key], expected).item()
+
+
+def test_qwen38_block_fp8_rejects_invalid_scale_grid():
+    from omlx.patches.mlx_vlm_mtp.qwen38_fp8 import dequantize_fp8_weights
+
+    with pytest.raises(ValueError, match="Invalid FP8 scale shape"):
+        dequantize_fp8_weights(
+            {
+                "proj.weight": mx.to_fp8(mx.ones((129, 129))),
+                "proj.weight_scale_inv": mx.ones((1, 2)),
+            }
+        )
+
+
 def _fake_drafter_model(model_type: str = "gemma4_assistant") -> MagicMock:
     """Build a stand-in for Gemma4AssistantDraftModel that satisfies the
     minimum API used by VLMMTPDrafter."""
@@ -409,6 +444,106 @@ class TestMoeConfigPatch:
 # ---------------------------------------------------------------------------
 # dense Qwen3.5 VLM runtime patch tests
 # ---------------------------------------------------------------------------
+
+
+def _qwen_vlm_with_attached_mtp(*, decode_enabled=True):
+    return SimpleNamespace(
+        language_model=SimpleNamespace(
+            mtp=object(),
+            _omlx_mtp_decode_enabled=decode_enabled,
+        )
+    )
+
+
+def test_root_mtp_weights_remap_to_attached_language_model():
+    from omlx.patches.mlx_vlm_mtp.qwen35_vlm_runtime import (
+        _remap_root_mtp_weights,
+    )
+
+    weights = [
+        ("language_model.model.embed_tokens.weight", object()),
+        ("mtp.fc.weight", object()),
+        ("mtp.fc.scales", object()),
+        ("mtp.fc.biases", object()),
+    ]
+
+    result = _remap_root_mtp_weights(_qwen_vlm_with_attached_mtp(), weights)
+
+    assert [key for key, _ in result] == [
+        "language_model.model.embed_tokens.weight",
+        "language_model.mtp.fc.weight",
+        "language_model.mtp.fc.scales",
+        "language_model.mtp.fc.biases",
+    ]
+
+
+def test_root_mtp_weights_remap_when_decode_is_disabled():
+    from omlx.patches.mlx_vlm_mtp.qwen35_vlm_runtime import (
+        _remap_root_mtp_weights,
+    )
+
+    result = _remap_root_mtp_weights(
+        _qwen_vlm_with_attached_mtp(decode_enabled=False),
+        [("mtp.norm.weight", object())],
+    )
+
+    assert result[0][0] == "language_model.mtp.norm.weight"
+
+
+def test_canonical_mtp_weights_pass_through_unchanged():
+    from omlx.patches.mlx_vlm_mtp.qwen35_vlm_runtime import (
+        _remap_root_mtp_weights,
+    )
+
+    weights = [("language_model.mtp.fc.weight", object())]
+
+    assert _remap_root_mtp_weights(_qwen_vlm_with_attached_mtp(), weights) is weights
+
+
+def test_root_mtp_weights_without_attached_module_pass_through():
+    from omlx.patches.mlx_vlm_mtp.qwen35_vlm_runtime import (
+        _remap_root_mtp_weights,
+    )
+
+    weights = [("mtp.fc.weight", object())]
+    model = SimpleNamespace(language_model=SimpleNamespace())
+
+    assert _remap_root_mtp_weights(model, weights) is weights
+
+
+def test_root_and_canonical_mtp_weights_are_rejected():
+    from omlx.patches.mlx_vlm_mtp.qwen35_vlm_runtime import (
+        _remap_root_mtp_weights,
+    )
+
+    weights = [
+        ("mtp.fc.weight", object()),
+        ("language_model.mtp.fc.weight", object()),
+    ]
+
+    with pytest.raises(ValueError, match="both root and canonical MTP weights"):
+        _remap_root_mtp_weights(_qwen_vlm_with_attached_mtp(), weights)
+
+
+def test_qwen_vlm_outer_load_weights_remaps_root_mtp(monkeypatch):
+    from omlx.patches.mlx_vlm_mtp import qwen35_vlm_runtime
+    from mlx_vlm.models import qwen3_5 as q35_outer
+
+    class FakeModel:
+        def load_weights(self, weights, strict=True):
+            self.received_weights = weights
+            self.received_strict = strict
+            return "loaded"
+
+    monkeypatch.setattr(q35_outer, "Model", FakeModel)
+    qwen35_vlm_runtime._patch_vlm_outer_model_load_weights()
+
+    model = FakeModel()
+    model.language_model = SimpleNamespace(mtp=object())
+
+    assert model.load_weights([("mtp.fc.weight", object())], strict=False) == "loaded"
+    assert model.received_weights[0][0] == "language_model.mtp.fc.weight"
+    assert model.received_strict is False
 
 
 def test_dense_vlm_runtime_return_hidden_uses_language_model_output_contract():

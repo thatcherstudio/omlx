@@ -218,6 +218,12 @@ def apply_deepseek_v4_patch() -> bool:
     # 9. One-time native indexer kernel probe (INFO/WARNING only).
     _probe_native_indexer_kernels()
 
+    # 10. sanitize() stacks the expert biases, so sharded_load's weight-index
+    #     gate would reject a local checkpoint the normal loader handles fine.
+    from omlx.patches.mlx_lm_sharded_load import install_local_sharded_load_fallback
+
+    install_local_sharded_load_fallback()
+
     _APPLIED = True
     logger.info("DeepSeek V4 patch applied (PR 1192 head %s)", PR_HEAD_SHA[:8])
     return True

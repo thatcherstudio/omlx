@@ -470,6 +470,34 @@ class TestResponsesEndpoint:
         assert data["output"][1]["content"][0]["text"] == "Hello!"
         assert data["usage"]["output_tokens_details"]["reasoning_tokens"] == 3
 
+    def test_response_endpoint_marks_length_as_incomplete(
+        self, client, mock_llm_engine
+    ):
+        mock_llm_engine.chat = AsyncMock(
+            return_value=MockGenerationOutput(
+                text="Partial response",
+                prompt_tokens=2,
+                completion_tokens=3,
+                finish_reason="length",
+                finished=True,
+            )
+        )
+
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Hello",
+                "max_output_tokens": 3,
+                "store": False,
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "incomplete"
+        assert data["incomplete_details"] == {"reason": "max_output_tokens"}
+
     def test_responses_forwards_request_chat_template_kwargs(
         self, client, mock_llm_engine
     ):
@@ -552,6 +580,45 @@ class TestResponsesEndpoint:
         assert output[1]["content"][0]["text"] == "Hello!"
         usage = completed["response"]["usage"]
         assert usage["output_tokens_details"]["reasoning_tokens"] == 3
+
+    def test_response_stream_emits_incomplete_event_on_length(
+        self, client, mock_llm_engine
+    ):
+        async def stream_chat(messages, **kwargs):
+            yield MockGenerationOutput(
+                text="Partial response",
+                new_text="Partial response",
+                prompt_tokens=2,
+                completion_tokens=3,
+                finish_reason="length",
+                finished=True,
+            )
+
+        mock_llm_engine.stream_chat = stream_chat
+
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Hello",
+                "max_output_tokens": 3,
+                "stream": True,
+                "store": False,
+            },
+        )
+
+        assert response.status_code == 200
+        terminal_block = response.text.strip().split("\n\n")[-1]
+        assert terminal_block.startswith("event: response.incomplete\n")
+        data_line = next(
+            line for line in terminal_block.splitlines() if line.startswith("data: ")
+        )
+        event = json.loads(data_line.removeprefix("data: "))
+        assert event["type"] == "response.incomplete"
+        assert event["response"]["status"] == "incomplete"
+        assert event["response"]["incomplete_details"] == {
+            "reason": "max_output_tokens"
+        }
 
     def test_response_stream_summary_log_names_model(self, client, caplog):
         with caplog.at_level("INFO", logger="omlx.server"):
@@ -764,6 +831,8 @@ class TestModelsStatusEndpoint:
             model_alias = "gpt-4o"
             max_context_window = 32768
             max_tokens = 8192
+            is_favorite = False
+            is_hidden = False
 
         class SettingsManager:
             def get_settings(self, model_id):
@@ -1929,6 +1998,285 @@ class TestMCPEndpoints:
         )
 
         assert response.status_code == 422
+
+
+class _RecordingMCPManager:
+    """MCP manager stand-in that records merge requests."""
+
+    def __init__(self):
+        self.calls = []
+
+    def get_merged_tools(self, user_tools=None):
+        self.calls.append(user_tools)
+        mcp_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "mcp_search",
+                    "description": "Search via MCP",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ]
+        return mcp_tools + (user_tools or [])
+
+    def get_all_tools_openai(self):
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "mcp_search",
+                    "description": "Search via MCP",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ]
+
+
+class TestMCPExposeToolsToggle:
+    """Settings > Global Settings > MCP: "Expose backend MCP tools to clients".
+
+    When the toggle is OFF, backend MCP tools must not be merged into client
+    requests, while tools the client itself sends still pass through.
+    """
+
+    USER_SEARCH_TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "user_search",
+                "description": "Search from request tools",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                    },
+                },
+            },
+        }
+    ]
+
+    USER_RESPONSE_TOOLS = [
+        {
+            "type": "function",
+            "name": "user_search",
+            "description": "Search from request tools",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                },
+            },
+        }
+    ]
+
+    def _install(self, expose_tools, manager):
+        """Install manager + toggle into server state; returns restore fn."""
+        from omlx.server import _server_state
+        from omlx.settings import GlobalSettings, MCPSettings
+
+        original_manager = _server_state.mcp_manager
+        original_settings = _server_state.global_settings
+        _server_state.mcp_manager = manager
+        _server_state.global_settings = GlobalSettings(
+            mcp=MCPSettings(
+                config_path="/mcp.json",
+                expose_tools=expose_tools,
+            )
+        )
+        return lambda: (
+            setattr(_server_state, "mcp_manager", original_manager),
+            setattr(_server_state, "global_settings", original_settings),
+        )
+
+    def _tool_names(self, recorded_chat_kwargs):
+        tools = recorded_chat_kwargs[0].get("tools") or []
+        return [t.get("function", {}).get("name") for t in tools]
+
+    @pytest.mark.parametrize(
+        ("expose_tools", "request_tools", "expect_mcp_merge"),
+        [
+            (True, None, True),
+            (False, None, False),
+            (False, "user_tools", False),
+        ],
+    )
+    def test_chat_completion_expose_tools_controls_mcp_merge(
+        self,
+        client,
+        mock_llm_engine,
+        expose_tools,
+        request_tools,
+        expect_mcp_merge,
+    ):
+        """OpenAI-compatible /v1/chat/completions honours the toggle."""
+        recorded_chat_kwargs = []
+
+        async def chat(messages, **kwargs):
+            recorded_chat_kwargs.append(kwargs)
+            return MockGenerationOutput(
+                text="Plain response.",
+                prompt_tokens=1,
+                completion_tokens=1,
+                finish_reason="stop",
+            )
+
+        manager = _RecordingMCPManager()
+        restore = self._install(expose_tools, manager)
+        mock_llm_engine.chat = chat
+
+        payload = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        if request_tools == "user_tools":
+            payload["tools"] = self.USER_SEARCH_TOOLS
+
+        try:
+            response = client.post("/v1/chat/completions", json=payload)
+        finally:
+            restore()
+
+        assert response.status_code == 200
+        assert recorded_chat_kwargs
+        names = self._tool_names(recorded_chat_kwargs)
+
+        if expect_mcp_merge:
+            assert manager.calls == [payload.get("tools")]
+            assert "mcp_search" in names
+        else:
+            assert manager.calls == []
+            assert "mcp_search" not in names
+            if request_tools == "user_tools":
+                assert "user_search" in names
+            else:
+                assert "tools" not in recorded_chat_kwargs[0]
+
+    @pytest.mark.parametrize(
+        ("expose_tools", "expect_mcp_merge"),
+        [
+            (True, True),
+            (False, False),
+        ],
+    )
+    def test_anthropic_messages_expose_tools_controls_mcp_merge(
+        self,
+        client,
+        mock_llm_engine,
+        expose_tools,
+        expect_mcp_merge,
+    ):
+        """Anthropic-compatible /v1/messages honours the toggle."""
+        recorded_chat_kwargs = []
+
+        async def chat(messages, **kwargs):
+            recorded_chat_kwargs.append(kwargs)
+            return MockGenerationOutput(
+                text="Plain response.",
+                prompt_tokens=1,
+                completion_tokens=1,
+                finish_reason="stop",
+            )
+
+        manager = _RecordingMCPManager()
+        restore = self._install(expose_tools, manager)
+        mock_llm_engine.chat = chat
+
+        payload = {
+            "model": "test-model",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "tools": [
+                {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            ],
+        }
+
+        try:
+            response = client.post("/v1/messages", json=payload)
+        finally:
+            restore()
+
+        assert response.status_code == 200
+        assert recorded_chat_kwargs
+        names = self._tool_names(recorded_chat_kwargs)
+
+        if expect_mcp_merge:
+            assert "mcp_search" in names
+            assert "get_weather" in names
+        else:
+            assert "mcp_search" not in names
+            assert "get_weather" in names
+
+    @pytest.mark.parametrize(
+        ("expose_tools", "expect_mcp_merge"),
+        [
+            (True, True),
+            (False, False),
+        ],
+    )
+    def test_responses_expose_tools_controls_mcp_merge(
+        self,
+        client,
+        mock_llm_engine,
+        expose_tools,
+        expect_mcp_merge,
+    ):
+        """OpenAI-compatible /v1/responses honours the toggle."""
+        recorded_chat_kwargs = []
+
+        async def chat(messages, **kwargs):
+            recorded_chat_kwargs.append(kwargs)
+            return MockGenerationOutput(
+                text="Plain response.",
+                prompt_tokens=1,
+                completion_tokens=1,
+                finish_reason="stop",
+            )
+
+        manager = _RecordingMCPManager()
+        restore = self._install(expose_tools, manager)
+        mock_llm_engine.chat = chat
+
+        payload = {
+            "model": "test-model",
+            "input": "Hello",
+            "tools": self.USER_RESPONSE_TOOLS,
+            "store": False,
+        }
+
+        try:
+            response = client.post("/v1/responses", json=payload)
+        finally:
+            restore()
+
+        assert response.status_code == 200
+        assert recorded_chat_kwargs
+        names = self._tool_names(recorded_chat_kwargs)
+        assert "user_search" in names
+
+        if expect_mcp_merge:
+            assert manager.calls
+            assert "mcp_search" in names
+        else:
+            assert manager.calls == []
+            assert "mcp_search" not in names
 
 
 class TestErrorHandling:

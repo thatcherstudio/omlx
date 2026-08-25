@@ -56,6 +56,21 @@ class TestAppendOnlyRendering:
         turn2 = render([SYSTEM, U1, A1, U2])
         assert not turn2.startswith(turn1)
 
+    def test_tool_adjacent_reminder_keeps_render_append_only(self):
+        # Claude Code appends a role=system reminder after a tool result
+        # (tool -> system -> assistant after adapter splitting). Relocation
+        # must keep the rendered prefix byte-stable when the next request
+        # appends another reminder at the tail.
+        reminder = {"role": "system", "content": "Task reminder"}
+        turn1 = [SYSTEM, U1, A_TOOL, TOOL, reminder]
+        turn2 = [SYSTEM, U1, A_TOOL, TOOL, reminder, A1, U2, reminder]
+
+        r1 = render(tmpl.relocate_mid_system_messages(turn1), drop_thinking=False)
+        r2 = render(tmpl.relocate_mid_system_messages(turn2), drop_thinking=False)
+        assert r2.startswith(r1)
+        assert r1.count("<｜latest_reminder｜>") == 1
+        assert r2.count("<｜latest_reminder｜>") == 2
+
     @pytest.mark.parametrize("mode", ["thinking", "chat"])
     def test_default_rendering_unchanged_across_cases(self, mode):
         # drop_thinking=True is the default; passing it explicitly must be

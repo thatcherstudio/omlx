@@ -12,6 +12,7 @@ Tests cover:
 
 import base64
 import io
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -175,6 +176,102 @@ class TestVLMStreamingCleanup:
         assert len(outputs) == 1
         assert outputs[0].generated_at == 10.0
         assert outputs[0].generated_until == 12.0
+
+
+class TestVLMToolForwarding:
+    """Tool schemas must reach scheduler requests on both chat paths."""
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "Write",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"content": {"type": "string"}},
+                },
+            },
+        }
+    ]
+
+    @staticmethod
+    def _process_chat_messages(*args):
+        return "prompt", None, {}, None, 0, []
+
+    @staticmethod
+    def _output(*, streaming=False):
+        return SimpleNamespace(
+            output_text="ok",
+            new_text="ok" if streaming else "",
+            prompt_tokens=1,
+            completion_tokens=1,
+            finished=streaming,
+            finish_reason="stop",
+            tool_calls=None,
+            cached_tokens=0,
+            first_token_at=None,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_chat_forwards_tools_to_core_generate(self):
+        executor = ThreadPoolExecutor(max_workers=1)
+        core = SimpleNamespace(
+            _mlx_executor=executor,
+            generate=AsyncMock(return_value=self._output()),
+        )
+        engine = _make_loaded_engine(model_type="muse_glimmer")
+        engine._engine = core
+
+        try:
+            with patch.object(
+                engine,
+                "_process_chat_messages",
+                side_effect=self._process_chat_messages,
+            ):
+                await engine.chat(
+                    [{"role": "user", "content": "write json"}], tools=self.tools
+                )
+        finally:
+            executor.shutdown(wait=False)
+
+        assert core.generate.call_args.kwargs["tools"] == self.tools
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_stream_chat_forwards_tools_to_core_request(self):
+        executor = ThreadPoolExecutor(max_workers=1)
+
+        async def stream_outputs(request_id):
+            yield self._output(streaming=True)
+
+        core = SimpleNamespace(
+            _mlx_executor=executor,
+            add_request=AsyncMock(return_value="request-1"),
+            stream_outputs=stream_outputs,
+            abort_request=AsyncMock(return_value=True),
+        )
+        engine = _make_loaded_engine(model_type="muse_glimmer")
+        engine._engine = core
+
+        try:
+            with patch.object(
+                engine,
+                "_process_chat_messages",
+                side_effect=self._process_chat_messages,
+            ):
+                async for _ in engine.stream_chat(
+                    [{"role": "user", "content": "write json"}], tools=self.tools
+                ):
+                    pass
+        finally:
+            executor.shutdown(wait=False)
+
+        assert core.add_request.call_args.kwargs["tools"] == self.tools
 
 
 class TestVLMDiffusionLane:
@@ -2411,8 +2508,6 @@ class TestVLMEngineFrequencyPenalty:
     async def test_chat_forwards_frequency_penalty_to_generate(self):
         """chat() forwards **kwargs into generate(), so the server's
         frequency_penalty kwarg must survive the chat -> generate chain."""
-        from concurrent.futures import ThreadPoolExecutor
-
         engine = _make_loaded_engine(model_type="test-vlm")
         mlx_executor = ThreadPoolExecutor(max_workers=1)
         engine._engine = SimpleNamespace(

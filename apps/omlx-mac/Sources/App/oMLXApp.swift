@@ -8,16 +8,34 @@
 //     status-item's "Admin Panel" command (or the Welcome wizard on first
 //     run, which lives in its own manual NSWindow controller).
 //   • `.handlesExternalEvents(matching: ["main"])` lets AppDelegate trigger
-//     the window the FIRST time via `NSWorkspace.shared.open(omlxapp://main)`
-//     when no NSWindow instance has been created yet. Subsequent shows
+//     the window the FIRST time by sending `omlxapp://main` to this exact app
+//     bundle when no NSWindow instance has been created yet. Subsequent shows
 //     just `makeKeyAndOrderFront` the cached window.
 //   • Dock-icon toggle (regular when visible, accessory when closed) is
 //     handled by AppDelegate via NSWindow notification observers — not in
 //     this file — so the welcome flow shares the same dock-icon logic.
 
+import Darwin
 import SwiftUI
 
 @main
+enum OMLXEntryPoint {
+    static func main() {
+        do {
+            if let request = try UpdateInstaller.workerRequest(
+                from: CommandLine.arguments
+            ) {
+                exit(UpdateInstaller.runWorker(request))
+            }
+        } catch {
+            NSLog("oMLX: invalid updater worker invocation: %@", error.localizedDescription)
+            exit(EXIT_FAILURE)
+        }
+
+        OMLXApp.main()
+    }
+}
+
 struct OMLXApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 

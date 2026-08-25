@@ -32,6 +32,16 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be an integer greater than 0")
+    return parsed
+
+
 def _has_cli_overrides(args) -> bool:
     """Check if CLI args contain non-default values that should be saved.
 
@@ -51,6 +61,7 @@ def _has_cli_overrides(args) -> bool:
         "paged_ssd_cache_dir",
         "paged_ssd_cache_max_size",
         "hot_cache_max_size",
+        "hot_cache_write_through",
         "initial_cache_blocks",
         "mcp_config",
         "hf_endpoint",
@@ -98,6 +109,12 @@ def serve_command(args):
 
     # Initialize global settings first (to get log_level from file if not specified)
     settings = init_settings(base_path=args.base_path, cli_args=args)
+
+    # The native ANE compile-cache gate reads this env var once, at the first
+    # compile, so it must be exported before any engine loads. setdefault
+    # keeps an explicit env override authoritative.
+    if settings.cache.ane_compile_cache:
+        os.environ.setdefault("OMLX_QWEN35_ANE_COMPILE_CACHE", "1")
 
     # Register TRACE level (5) — includes full message content
     TRACE = 5
@@ -294,6 +311,13 @@ def serve_command(args):
             scheduler_config.hot_cache_max_size = hot_cache_max_bytes
         else:
             scheduler_config.hot_cache_max_size = 0
+
+        # Write-through: explicit CLI flag > settings file (already mapped by
+        # settings.to_scheduler_config()).
+        if getattr(args, "hot_cache_write_through", None) is not None:
+            scheduler_config.hot_cache_write_through = bool(
+                args.hot_cache_write_through
+            )
 
         if args.no_cache:
             print(
@@ -531,6 +555,7 @@ def launch_command(args, extra_args: list[str] | None = None):
         reasoning=model_info.get("enable_thinking"),
         tools_profile=getattr(args, "tools_profile", "coding"),
         extra_args=tuple(extra_args or ()),
+        cross_session=getattr(args, "cross_session", False),
     )
 
     # Launch
@@ -786,6 +811,172 @@ def diagnose_command(args) -> int:
     return 1
 
 
+def cluster_command(args) -> int:
+    """Run cluster diagnostics, collective checks, and shard planning."""
+    import json
+
+    action = getattr(args, "cluster_action", None)
+    if action == "status":
+        from .cluster.probe import collect_cluster_status, format_cluster_status
+
+        try:
+            status = collect_cluster_status(route_to=args.route_to)
+        except ValueError as exc:
+            print(f"Cluster status error: {exc}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(status.to_dict(), indent=2, sort_keys=True))
+        else:
+            print(format_cluster_status(status))
+        return 0
+
+    if action == "worker-smoke":
+        from .cluster.supervisor import run_worker_smoke
+
+        try:
+            result = run_worker_smoke(timeout=args.timeout)
+        except (OSError, RuntimeError, TimeoutError) as exc:
+            print(f"Cluster worker smoke failed: {exc}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            print("oMLX cluster worker smoke passed")
+            print(f"Worker PID:  {result['worker_pid']}")
+            print(f"Protocol:    {result['protocol_version']}")
+            print(f"Round trip:  {result['elapsed_seconds']:.3f}s")
+        return 0
+
+    if action == "collective-smoke":
+        from .cluster.collective import (
+            CollectiveSmokeError,
+            run_local_collective_smoke,
+        )
+
+        try:
+            result = run_local_collective_smoke(timeout=args.timeout)
+        except (CollectiveSmokeError, OSError, RuntimeError, ValueError) as exc:
+            print(f"Cluster collective smoke failed: {exc}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            print("oMLX local MLX collective smoke passed")
+            print(f"Backend:     {result['backend']} (loopback only)")
+            print(f"Ranks:       {result['rank_count']}")
+            print(f"All-sum:     {result['expected_sum']}")
+            print(f"MLX:         {result['mlx_version']}")
+            print(f"Elapsed:     {result['elapsed_seconds']:.3f}s")
+        return 0
+
+    if action == "pipeline-smoke":
+        from .cluster.collective import (
+            CollectiveSmokeError,
+            run_local_pipeline_smoke,
+        )
+
+        try:
+            result = run_local_pipeline_smoke(timeout=args.timeout)
+        except (CollectiveSmokeError, OSError, RuntimeError, ValueError) as exc:
+            print(f"Cluster pipeline smoke failed: {exc}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            print("oMLX unequal Nemotron-H pipeline smoke passed")
+            print(f"Backend:     {result['backend']} (loopback only)")
+            print(f"Ranks:       {result['rank_count']}")
+            print(f"Checksum:    {result['ranks'][0]['checksum']}")
+            print(f"Elapsed:     {result['elapsed_seconds']:.3f}s")
+        return 0
+
+    if action == "plan":
+        import socket
+
+        from .cluster.planner import (
+            NodeBudget,
+            PlanningError,
+            format_shard_plan,
+            locate_model_layout,
+            plan_unequal_pipeline,
+            synthetic_model_layout,
+        )
+        from .config import parse_size
+        from .utils import hardware
+
+        def parse_cluster_size(value: str) -> int:
+            normalized = (
+                value.strip()
+                .upper()
+                .replace("KIB", "KB")
+                .replace("MIB", "MB")
+                .replace("GIB", "GB")
+                .replace("TIB", "TB")
+            )
+            size = parse_size(normalized)
+            if size < 0:
+                raise ValueError("sizes must be non-negative")
+            return size
+
+        try:
+            reserve_bytes = parse_cluster_size(args.reserve)
+            nodes = []
+            for rank, definition in enumerate(args.node or []):
+                node_id, separator, raw_size = definition.rpartition("=")
+                if not separator or not node_id.strip() or not raw_size.strip():
+                    raise ValueError("--node must use NAME=SIZE (for example studio=256GB)")
+                nodes.append(
+                    NodeBudget(
+                        node_id=node_id.strip(),
+                        capacity_bytes=parse_cluster_size(raw_size),
+                        reserve_bytes=reserve_bytes,
+                        rank=rank,
+                    )
+                )
+            if not nodes:
+                detected = hardware.detect_hardware()
+                nodes.append(
+                    NodeBudget(
+                        node_id=socket.gethostname(),
+                        capacity_bytes=detected.max_working_set_bytes,
+                        reserve_bytes=reserve_bytes,
+                        rank=0,
+                    )
+                )
+
+            holder = None
+            if args.model:
+                # The Mac being planned for is often the one holding a single
+                # stage, so ask each peer rather than assume this node can
+                # read the whole model.
+                holder = locate_model_layout(args.model, args.peer or [])
+                model = holder.layout
+            else:
+                model = synthetic_model_layout(
+                    total_weight_bytes=parse_cluster_size(args.model_size),
+                    layer_count=args.layers,
+                )
+            plan = plan_unequal_pipeline(model, nodes)
+        except (OSError, PlanningError, ValueError) as exc:
+            print(f"Cluster planning failed: {exc}", file=sys.stderr)
+            return 2
+
+        if args.json:
+            print(json.dumps(plan.to_dict(), indent=2, sort_keys=True))
+        else:
+            print(format_shard_plan(plan))
+            if holder is not None and not holder.is_local:
+                print(f"Measured:    {holder.node} (the node holding the model)")
+        return 0
+
+    print(
+        "Unknown cluster action. Available: status, worker-smoke, "
+        "collective-smoke, pipeline-smoke, plan",
+        file=sys.stderr,
+    )
+    return 2
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="omlx: Production-ready LLM server for Apple Silicon",
@@ -927,6 +1118,13 @@ Example directory structure:
         type=str,
         default=None,
         help="Maximum in-memory hot cache size (e.g., '8GB', '4GB'). Default: 0 (disabled)",
+    )
+    serve_parser.add_argument(
+        "--hot-cache-write-through",
+        action="store_true",
+        default=None,
+        help="Persist every hot-cache block to SSD immediately (write-through). "
+        "Keeps RAM-speed resume while retaining SSD durability for all sessions.",
     )
     serve_parser.add_argument(
         "--no-cache",
@@ -1082,6 +1280,17 @@ Example directory structure:
         default=None,
         help="Claude Code Haiku tier model (Claude integration only)",
     )
+    launch_parser.add_argument(
+        "--cross-session",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow the launched session to be reachable via Claude Code's "
+            "cross-session messaging (ListAgents/SendMessage). This requires "
+            "enabling telemetry and feature-flag traffic to Anthropic that is "
+            "otherwise kept disabled by default (Claude integration only)."
+        ),
+    )
 
     # Diagnose command
     diagnose_parser = subparsers.add_parser(
@@ -1096,10 +1305,144 @@ Example directory structure:
         help="What to diagnose. 'menubar' checks Tahoe ControlCenter visibility.",
     )
 
-    # Use parse_known_args so `omlx launch <tool> -- ...` can forward unknown
-    # tokens (e.g. `-r`, `--resume <id>`) to the underlying tool binary.
-    # Non-launch commands keep the previous strictness by rejecting unknowns.
-    args, extra_args = parser.parse_known_args()
+    # Cluster diagnostics and planning for the first implementation slice.
+    cluster_parser = subparsers.add_parser(
+        "cluster",
+        help="Inspect distributed-node readiness and exercise a local worker",
+        description=(
+            "Distributed-cluster diagnostics and unequal-memory planning. "
+            "This command does not configure interfaces or initialize JACCL."
+        ),
+    )
+    cluster_subparsers = cluster_parser.add_subparsers(
+        dest="cluster_action",
+        required=True,
+        help="Cluster diagnostic command",
+    )
+    cluster_status_parser = cluster_subparsers.add_parser(
+        "status",
+        help="Report local memory, runtime, RDMA, and Thunderbolt readiness",
+    )
+    cluster_status_parser.add_argument(
+        "--route-to",
+        metavar="IP",
+        default=None,
+        help="Also inspect the active route to an IPv4 or IPv6 peer address",
+    )
+    cluster_status_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON",
+    )
+    cluster_smoke_parser = cluster_subparsers.add_parser(
+        "worker-smoke",
+        help="Run a real isolated worker ready/ping/shutdown round trip",
+    )
+    cluster_smoke_parser.add_argument(
+        "--timeout",
+        type=_positive_float,
+        default=5.0,
+        help="Per-operation worker deadline in seconds (default: 5)",
+    )
+    cluster_smoke_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON",
+    )
+    cluster_collective_parser = cluster_subparsers.add_parser(
+        "collective-smoke",
+        help="Run two local MLX ranks and verify a ring all-sum",
+    )
+    cluster_collective_parser.add_argument(
+        "--timeout",
+        type=_positive_float,
+        default=20.0,
+        help="Overall collective deadline in seconds (default: 20)",
+    )
+    cluster_collective_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON",
+    )
+    cluster_pipeline_parser = cluster_subparsers.add_parser(
+        "pipeline-smoke",
+        help="Run an unequal two-rank hybrid Nemotron-H graph",
+    )
+    cluster_pipeline_parser.add_argument(
+        "--timeout",
+        type=_positive_float,
+        default=30.0,
+        help="Overall pipeline deadline in seconds (default: 30)",
+    )
+    cluster_pipeline_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON",
+    )
+    cluster_plan_parser = cluster_subparsers.add_parser(
+        "plan",
+        help="Plan contiguous layers across unequal node memory budgets",
+    )
+    cluster_plan_source = cluster_plan_parser.add_mutually_exclusive_group(
+        required=True
+    )
+    cluster_plan_source.add_argument(
+        "--model",
+        metavar="PATH",
+        help="Inspect safetensors headers from a downloaded model directory",
+    )
+    cluster_plan_source.add_argument(
+        "--model-size",
+        metavar="SIZE",
+        help="Plan an estimated model before download (for example 300GB)",
+    )
+    cluster_plan_parser.add_argument(
+        "--layers",
+        type=_positive_int,
+        default=80,
+        help="Layer count used with --model-size (default: 80)",
+    )
+    cluster_plan_parser.add_argument(
+        "--node",
+        action="append",
+        metavar="NAME=SIZE",
+        help=(
+            "Node memory budget in rank order; repeat for each node. "
+            "Defaults to this Mac's recommended working set."
+        ),
+    )
+    cluster_plan_parser.add_argument(
+        "--reserve",
+        default="0",
+        metavar="SIZE",
+        help="Memory to reserve on every node for KV/activations (default: 0)",
+    )
+    cluster_plan_parser.add_argument(
+        "--peer",
+        action="append",
+        metavar="SSH_HOST",
+        help=(
+            "SSH host that may hold the model; repeat for each. Used with "
+            "--model when this Mac holds only its own stage: the first peer "
+            "that can read a complete model is the one that measures it."
+        ),
+    )
+    cluster_plan_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON",
+    )
+
+    # Split launch's forwarding separator before argparse. parse_known_args()
+    # inconsistently retains it when known options precede it, and stripping it
+    # afterward cannot distinguish it from a separator intended for the tool.
+    argv = sys.argv[1:]
+    if argv[:1] == ["launch"] and "--" in argv[2:]:
+        separator_index = argv.index("--", 2)
+        args, extra_args = parser.parse_known_args(argv[:separator_index])
+        extra_args.extend(argv[separator_index + 1 :])
+    else:
+        args, extra_args = parser.parse_known_args(argv)
 
     if args.command == "launch":
         launch_command(args, extra_args=extra_args)
@@ -1120,6 +1463,8 @@ Example directory structure:
             sys.exit(lifecycle_command(args))
         elif args.command == "diagnose":
             sys.exit(diagnose_command(args))
+        elif args.command == "cluster":
+            sys.exit(cluster_command(args))
         else:
             parser.print_help()
             sys.exit(1)

@@ -1385,7 +1385,8 @@ class TestMetalWiredLimit:
         # left untouched.
         mock_mx.set_wired_limit.assert_not_called()
         total = 512 * 1024**3
-        assert enforcer._metal_wired_limit_request == total - total // 20
+        expected = (total - total // 20) // (1024**2) * 1024**2
+        assert enforcer._metal_wired_limit_request == expected
         assert "leaving Apple's default Metal cap active" in caplog.text
 
     def test_start_handles_set_wired_limit_error(self, mock_engine_pool):
@@ -1922,6 +1923,23 @@ class TestUnresolvableSchedulerWarning:
         ]
         assert warnings == []
 
+    def test_externally_managed_guard_without_scheduler_does_not_warn(
+        self, enforcer, caplog
+    ):
+        """Distributed coordinators delegate the guard to rank processes."""
+        engine = MagicMock(spec=["_prefill_memory_guard_managed_externally"])
+        engine._prefill_memory_guard_managed_externally = True
+        entry = _make_entry("model-distributed", engine=engine)
+        enforcer._engine_pool._entries = {"model-distributed": entry}
+
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            enforcer._propagate_memory_limit()
+
+        warnings = [
+            r for r in caplog.records if "could not resolve scheduler" in r.getMessage()
+        ]
+        assert warnings == []
+
     def test_non_streaming_engine_without_scheduler_does_not_warn(
         self, enforcer, caplog
     ):
@@ -2297,7 +2315,9 @@ class TestTwoWatermarkPressureLevels:
         assert enforcer_2wm._pressure_level == "hard"
 
     @pytest.mark.asyncio
-    async def test_hard_pressure_shrinks_hot_cache_before_abort(self, mock_engine_pool):
+    async def test_hard_pressure_without_reachable_scheduler_shrinks_hot_cache(
+        self, mock_engine_pool
+    ):
         budget = MagicMock()
         budget.total_bytes = 20 * 1024**3
         budget.max_bytes = 20 * 1024**3
@@ -2620,7 +2640,8 @@ class TestWiredLimitSuggestionClamp:
         with self._with_total(total):
             clamped = pme._wired_limit_suggestion_bytes(desired)
         # 5% of 512 GiB = 25.6 GiB reserve
-        assert clamped == total - total // 20
+        expected = (total - total // 20) // (1024**2) * 1024**2
+        assert clamped == expected
         assert clamped < desired
 
     def test_small_mac_recommendation_unchanged(self):
@@ -2636,7 +2657,17 @@ class TestWiredLimitSuggestionClamp:
         total = 4 * 1024**3
         with self._with_total(total):
             clamped = pme._wired_limit_suggestion_bytes(8 * 1024**3)
-        assert clamped == total - total // 20
+        expected = (total - total // 20) // (1024**2) * 1024**2
+        assert clamped == expected
+
+    def test_128_gib_suggestion_floors_to_whole_mib(self):
+        """The sysctl accepts whole MiB, so the 95% threshold must not be
+        rounded up past the safe byte limit in the admin UI."""
+        total = 128 * 1024**3
+        desired = 122 * 1024**3
+        with self._with_total(total):
+            suggestion = pme._wired_limit_suggestion_bytes(desired)
+        assert suggestion == 124518 * 1024**2
 
     def test_log_hint_uses_clamped_value(self, caplog):
         total = 512 * 1024**3
@@ -2661,21 +2692,17 @@ class TestWiredLimitSuggestionClamp:
         """A user cap at the recommended level must not trigger the raise hint
         even when the static ceiling is higher (the #2184 report followed the
         old hint into a jetsam crash-loop)."""
-        total = 512 * 1024**3
-        desired = total - 8 * 1024**3  # 504 GiB ceiling
-        user_cap = total - total // 20  # exactly the recommendation
+        total = 128 * 1024**3
+        desired = 122 * 1024**3
+        user_cap = 124518 * 1024**2  # highest whole-MiB value below 95%
         with (
             self._with_total(total),
-            patch.object(
-                pme, "get_iogpu_wired_limit_bytes", return_value=user_cap
-            ),
+            patch.object(pme, "get_iogpu_wired_limit_bytes", return_value=user_cap),
             patch.object(pme.mx, "set_wired_limit", return_value=0),
             caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"),
         ):
             pme._apply_metal_wired_limit(desired)
-        assert not [
-            r for r in caplog.records if "Raise it with" in r.message
-        ]
+        assert not [r for r in caplog.records if "Raise it with" in r.message]
 
     def test_near_physical_user_cap_warns_jetsam(self, caplog):
         total = 512 * 1024**3
@@ -2707,24 +2734,27 @@ class TestPressureCacheReclaim:
         schedulers = [MagicMock(), MagicMock()]
         enforcer = self._enforcer(schedulers)
         with patch.object(pme.mx, "get_cache_memory", return_value=0):
-            enforcer._request_scheduler_cache_reclaim(1 * 1024**3)
+            requested = enforcer._request_scheduler_cache_reclaim(1 * 1024**3)
         for s in schedulers:
             s.request_pressure_reclaim.assert_called_once()
+        assert requested == 2
 
     def test_skips_when_nothing_reclaimable(self):
         schedulers = [MagicMock()]
         enforcer = self._enforcer(schedulers)
         with patch.object(pme.mx, "get_cache_memory", return_value=1 * 1024**3):
-            enforcer._request_scheduler_cache_reclaim(0)
+            requested = enforcer._request_scheduler_cache_reclaim(0)
         schedulers[0].request_pressure_reclaim.assert_not_called()
+        assert requested == 0
 
     def test_fires_on_stranded_pool_without_hot_cache(self):
         """The already-wedged case: hot cache empty, bytes parked in the pool."""
         schedulers = [MagicMock()]
         enforcer = self._enforcer(schedulers)
         with patch.object(pme.mx, "get_cache_memory", return_value=3 * 1024**3):
-            enforcer._request_scheduler_cache_reclaim(0)
+            requested = enforcer._request_scheduler_cache_reclaim(0)
         schedulers[0].request_pressure_reclaim.assert_called_once()
+        assert requested == 1
 
     def test_tolerates_non_numeric_pool_reading(self):
         """A wholesale-mocked mx (as the wider suite uses) must not break
@@ -2732,8 +2762,9 @@ class TestPressureCacheReclaim:
         schedulers = [MagicMock()]
         enforcer = self._enforcer(schedulers)
         with patch.object(pme.mx, "get_cache_memory", return_value=object()):
-            enforcer._request_scheduler_cache_reclaim(0)
+            requested = enforcer._request_scheduler_cache_reclaim(0)
         schedulers[0].request_pressure_reclaim.assert_not_called()
+        assert requested == 0
 
 
 class TestPublicCeilingBreakdown:
@@ -2788,10 +2819,9 @@ class TestPublicCeilingBreakdown:
         }
 
 
-class TestBusyAbortReclaimGrace:
-    """Reclaim-before-abort grace: a fat MLX buffer pool gets a bounded
-    number of polls to drain before the busy-request abort fires
-    (measured: aborts 0.1GB over the watermark with 3.7GB pooled)."""
+class TestPressureReclaimGrace:
+    """Reclaim-first grace gives pooled Metal buffers a bounded chance to
+    drain before destructive hot-cache shrinking or request aborts."""
 
     def _busy_setup(self, enforcer):
         engine = MagicMock()
@@ -2804,57 +2834,147 @@ class TestBusyAbortReclaimGrace:
         return engine
 
     @pytest.mark.asyncio
-    async def test_abort_deferred_while_pool_reclaimable(self, enforcer):
+    async def test_reclaim_defers_hot_cache_shrink_and_abort(self, enforcer):
         engine = self._busy_setup(enforcer)
-        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+        scheduler = engine.scheduler
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch.object(
+                enforcer, "_shrink_hot_cache_for_pressure", return_value=0
+            ) as shrink,
+        ):
             # Fixture thresholds are 1.0: 11GB is over the 10GB watermark
             # but not emergency (needs ceiling + 2GB or 2 polls over).
             mock_mx.get_active_memory.return_value = 11 * 1024**3
             mock_mx.get_cache_memory.return_value = 3 * 1024**3
             await enforcer._check_and_enforce()
         engine.abort_all_requests.assert_not_awaited()
-        assert enforcer._busy_abort_grace_polls == 1
+        scheduler.request_pressure_reclaim.assert_called_once()
+        scheduler.adjust_store_cache_cap.assert_called_once_with("hard")
+        shrink.assert_not_called()
+        mock_mx.get_cache_memory.assert_called_once()
+        assert enforcer._pressure_reclaim_grace_polls == 1
 
     @pytest.mark.asyncio
-    async def test_abort_fires_after_grace_exhausted(self, enforcer):
+    async def test_destructive_enforcement_fires_after_grace_exhausted(self, enforcer):
         engine = self._busy_setup(enforcer)
-        enforcer._busy_abort_grace_polls = (
-            enforcer._BUSY_ABORT_GRACE_POLLS_MAX
-        )
-        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
-            mock_mx.get_active_memory.return_value = 11 * 1024**3
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch.object(
+                enforcer, "_shrink_hot_cache_for_pressure", return_value=0
+            ) as shrink,
+        ):
+            enforcer._soft_threshold = 0.90
+            enforcer._hard_threshold = 0.95
+            mock_mx.get_active_memory.return_value = int(9.6 * 1024**3)
             mock_mx.get_cache_memory.return_value = 3 * 1024**3
+            for _ in range(enforcer._PRESSURE_RECLAIM_GRACE_POLLS_MAX):
+                await enforcer._check_and_enforce()
+
+            engine.abort_all_requests.assert_not_awaited()
+            shrink.assert_not_called()
+            assert enforcer._pressure_reclaim_grace_polls == (
+                enforcer._PRESSURE_RECLAIM_GRACE_POLLS_MAX
+            )
+
             await enforcer._check_and_enforce()
         engine.abort_all_requests.assert_awaited_once()
+        shrink.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_abort_immediate_when_pool_below_floor(self, enforcer):
-        """Custom-regime parity: nothing worth draining -> no deferral."""
+    async def test_destructive_enforcement_is_immediate_when_pool_below_floor(
+        self, enforcer
+    ):
+        """Nothing worth draining means no deferral."""
         engine = self._busy_setup(enforcer)
-        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch.object(
+                enforcer, "_shrink_hot_cache_for_pressure", return_value=0
+            ) as shrink,
+        ):
             mock_mx.get_active_memory.return_value = 11 * 1024**3
             mock_mx.get_cache_memory.return_value = 1 * 1024**3
             await enforcer._check_and_enforce()
         engine.abort_all_requests.assert_awaited_once()
-        assert enforcer._busy_abort_grace_polls == 0
+        shrink.assert_called_once()
+        assert enforcer._pressure_reclaim_grace_polls == 0
 
     @pytest.mark.asyncio
     async def test_grace_counter_resets_on_recovery(self, enforcer):
         self._busy_setup(enforcer)
-        enforcer._busy_abort_grace_polls = 3
+        enforcer._pressure_reclaim_grace_polls = 3
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
             mock_mx.get_active_memory.return_value = 1 * 1024**3
             mock_mx.get_cache_memory.return_value = 0
             await enforcer._check_and_enforce()
-        assert enforcer._busy_abort_grace_polls == 0
+        assert enforcer._pressure_reclaim_grace_polls == 0
+
+    @pytest.mark.asyncio
+    async def test_grace_counter_resets_when_stopped(self, enforcer):
+        enforcer._pressure_reclaim_grace_polls = 3
+
+        await enforcer.stop()
+
+        assert enforcer._pressure_reclaim_grace_polls == 0
 
     @pytest.mark.asyncio
     async def test_emergency_aborts_despite_pool(self, enforcer):
         """At/over the ceiling the grace never applies."""
         engine = self._busy_setup(enforcer)
-        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch.object(
+                enforcer, "_shrink_hot_cache_for_pressure", return_value=0
+            ) as shrink,
+        ):
             # 13GB: >= ceiling + 2GB -> emergency on the first poll.
             mock_mx.get_active_memory.return_value = 13 * 1024**3
             mock_mx.get_cache_memory.return_value = 3 * 1024**3
             await enforcer._check_and_enforce()
         engine.abort_all_requests.assert_awaited()
+        shrink.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_disabled_reclaim_falls_through_to_shrink_and_abort(
+        self, enforcer, monkeypatch
+    ):
+        engine = self._busy_setup(enforcer)
+        scheduler = engine.scheduler
+        monkeypatch.setenv("OMLX_DISABLE_PRESSURE_RECLAIM", "1")
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch.object(
+                enforcer, "_shrink_hot_cache_for_pressure", return_value=0
+            ) as shrink,
+        ):
+            mock_mx.get_active_memory.return_value = 11 * 1024**3
+            mock_mx.get_cache_memory.return_value = 3 * 1024**3
+            await enforcer._check_and_enforce()
+        scheduler.request_pressure_reclaim.assert_not_called()
+        shrink.assert_called_once()
+        engine.abort_all_requests.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_reachable_scheduler_falls_through_to_shrink_and_abort(
+        self, enforcer
+    ):
+        engine = SimpleNamespace(
+            has_active_requests=lambda: False,
+            abort_all_requests=AsyncMock(return_value=1),
+        )
+        entry = _make_entry("big-model", engine=engine)
+        entry.in_use = 1
+        enforcer._engine_pool._entries = {"big-model": entry}
+        enforcer._engine_pool._find_lru_victim.return_value = None
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch.object(
+                enforcer, "_shrink_hot_cache_for_pressure", return_value=0
+            ) as shrink,
+        ):
+            mock_mx.get_active_memory.return_value = 11 * 1024**3
+            mock_mx.get_cache_memory.return_value = 3 * 1024**3
+            await enforcer._check_and_enforce()
+        shrink.assert_called_once()
+        engine.abort_all_requests.assert_awaited_once()

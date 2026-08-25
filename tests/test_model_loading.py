@@ -9,8 +9,10 @@ import pytest
 
 from omlx.utils import model_loading
 from omlx.utils.model_loading import (
+    ensure_model_code_trusted,
     maybe_apply_pre_load_patches,
     maybe_load_custom_quantization,
+    preflight_text_remote_code,
 )
 
 
@@ -28,6 +30,69 @@ def _write_mtp_index(tmp_path, has_mtp: bool) -> None:
     (tmp_path / "model.safetensors.index.json").write_text(
         '{"metadata": {}, "weight_map": ' + str(keys).replace("'", '"') + "}"
     )
+
+
+class TestRemoteCodePreflight:
+    def test_custom_model_file_is_rejected_before_weight_loading(self, tmp_path):
+        with pytest.raises(ValueError, match="Enable Trust Remote Code"):
+            ensure_model_code_trusted(
+                {"model_file": "modeling_custom.py"},
+                model_path=tmp_path,
+                trust_remote_code=False,
+            )
+
+    def test_tokenizer_trust_failure_happens_before_mlx_lm_load(
+        self, tmp_path, monkeypatch
+    ):
+        (tmp_path / "config.json").write_text(
+            '{"model_type": "llama", "auto_map": {"AutoConfig": "x.Y"}}'
+        )
+        (tmp_path / "tokenizer_config.json").write_text(
+            '{"auto_map": {"AutoTokenizer": ["tokenization_x.X", null]}}'
+        )
+
+        tokenizer_load = MagicMock(
+            side_effect=ValueError("trust_remote_code=True is required")
+        )
+        fake_utils = types.SimpleNamespace(
+            _download=MagicMock(return_value=tmp_path),
+            load_config=MagicMock(
+                return_value={
+                    "model_type": "llama",
+                    "auto_map": {"AutoConfig": "x.Y"},
+                }
+            ),
+            load_tokenizer=tokenizer_load,
+        )
+        model_load = MagicMock()
+        fake_mlx_lm = types.ModuleType("mlx_lm")
+        fake_mlx_lm.utils = fake_utils
+        fake_mlx_lm.load = model_load
+        monkeypatch.setitem(sys.modules, "mlx_lm", fake_mlx_lm)
+
+        with pytest.raises(ValueError, match="trust_remote_code=True"):
+            model_loading.lm_load_compat(str(tmp_path), trust_remote_code=False)
+
+        model_load.assert_not_called()
+        tokenizer_load.assert_called_once()
+        assert tokenizer_load.call_args.args[1]["trust_remote_code"] is False
+
+    def test_safe_metadata_does_not_load_the_tokenizer_twice(
+        self, tmp_path, monkeypatch
+    ):
+        (tmp_path / "config.json").write_text('{"model_type": "llama"}')
+        fake_utils = types.SimpleNamespace(
+            _download=MagicMock(return_value=tmp_path),
+            load_config=MagicMock(return_value={"model_type": "llama"}),
+            load_tokenizer=MagicMock(),
+        )
+        fake_mlx_lm = types.ModuleType("mlx_lm")
+        fake_mlx_lm.utils = fake_utils
+        monkeypatch.setitem(sys.modules, "mlx_lm", fake_mlx_lm)
+
+        preflight_text_remote_code(str(tmp_path), trust_remote_code=False)
+
+        fake_utils.load_tokenizer.assert_not_called()
 
 
 class TestNoDispatch:
@@ -427,6 +492,27 @@ class TestVlmMtpPreLoadDispatch:
         stub = sys.modules["omlx.patches.mlx_lm_mtp"]
         stub.set_mtp_depth.assert_called_once_with(8)
 
+    def test_gemma4_unified_merged_assistant_dispatch(self, tmp_path, monkeypatch):
+        # Unified Gemma 4 exports share the Gemma 4 language runtime but use
+        # their own top-level config and TextConfig subclass.
+        calls, sanitize_mock, runtime_mock, attach_mock = self._stub_patches(
+            monkeypatch
+        )
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "gemma4_unified", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 4}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(mtp_enabled=True)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        sanitize_mock.assert_called_once()
+        runtime_mock.assert_called_once()
+        attach_mock.assert_called_once_with(True)
+        assert calls == ["attach=True", "sanitize", "runtime"]
+
     def test_gemma4_explicit_depth_overrides_default(self, tmp_path, monkeypatch):
         self._stub_patches(monkeypatch)
         path = _write_config(
@@ -695,6 +781,23 @@ class TestExpandPerLayerQuantKeys:
         )
         # The original key is preserved (other code paths may still use it)
         assert "model.layers.1.mlp.gate" in cfg["quantization"]
+
+    def test_minimax_overrides_follow_the_mlx_lm_adapter_root(self):
+        gate = "language_model.model.layers.50.block_sparse_moe.gate"
+        spec = {"bits": 8, "group_size": 64, "mode": "affine"}
+        cfg = {
+            "model_type": "minimax_m3_vl",
+            "quantization": {
+                "bits": 4,
+                "group_size": 64,
+                "mode": "affine",
+                gate: spec,
+            },
+        }
+
+        model_loading.expand_per_layer_quant_keys(cfg)
+
+        assert cfg["quantization"][f"inner.{gate}"] == spec
 
 
 class TestMaterializeLazyState:

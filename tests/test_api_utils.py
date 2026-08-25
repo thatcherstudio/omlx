@@ -52,9 +52,34 @@ from omlx.api.utils import (
     extract_harmony_messages,
     extract_multimodal_content,
     extract_text_content,
+    merge_reasoning_effort_chat_template_kwargs,
     prepare_system_messages_for_template,
     uses_native_reasoning_content,
 )
+
+
+class TestReasoningEffortChatTemplateKwargs:
+    def test_adds_top_level_reasoning_effort(self):
+        assert merge_reasoning_effort_chat_template_kwargs(None, "xhigh") == {
+            "reasoning_effort": "xhigh"
+        }
+
+    def test_explicit_template_kwarg_wins(self):
+        original = {"reasoning_effort": "low", "enable_thinking": True}
+
+        merged = merge_reasoning_effort_chat_template_kwargs(original, "xhigh")
+
+        assert merged == original
+        assert merged is not original
+
+    def test_empty_inputs_return_none(self):
+        assert merge_reasoning_effort_chat_template_kwargs(None, None) is None
+
+    def test_numeric_effort_forwarded_unchanged(self):
+        merged = merge_reasoning_effort_chat_template_kwargs(None, 0.9)
+
+        assert merged == {"reasoning_effort": 0.9}
+        assert isinstance(merged["reasoning_effort"], float)
 
 
 class TestCleanOutputText:
@@ -2188,6 +2213,36 @@ class TestPrepareSystemMessagesForTemplate:
                 )
             return "user:__OMLX_MID_SYSTEM_PROBE_USER__"
 
+    class ToolHistoryTokenizer(PreserveTokenizer):
+        chat_template = "tool-history-mid-system"
+
+        def apply_chat_template(self, messages, **kwargs):
+            for index, message in enumerate(messages):
+                if message["role"] != "tool":
+                    continue
+                if index == 0 or messages[index - 1]["role"] != "assistant":
+                    raise ValueError("tool message must follow an assistant")
+                tool_call_id = message.get("tool_call_id")
+                tool_call_ids = {
+                    call.get("id") for call in messages[index - 1].get("tool_calls", [])
+                }
+                if tool_call_id not in tool_call_ids:
+                    raise ValueError("tool result must match a tool call")
+            return super().apply_chat_template(messages, **kwargs)
+
+    class UserOnlyMidSystemTokenizer(PreserveTokenizer):
+        chat_template = "user-only-mid-system"
+
+        def apply_chat_template(self, messages, **kwargs):
+            for index, message in enumerate(messages):
+                if (
+                    message["role"] == "system"
+                    and index > 0
+                    and messages[index - 1]["role"] != "user"
+                ):
+                    raise ValueError("mid-system message must follow a user")
+            return super().apply_chat_template(messages, **kwargs)
+
     class ExplicitlyUnsupportedTokenizer(PreserveTokenizer):
         _omlx_supports_mid_system_messages = False
 
@@ -2274,6 +2329,87 @@ class TestPrepareSystemMessagesForTemplate:
         )
 
         assert [m["role"] for m in result] == ["user", "system", "assistant"]
+
+    def test_preserves_between_system_after_tool_when_exact_probe_passes(self):
+        messages = [
+            {"role": "user", "content": "Use the lookup tool"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "lookup", "arguments": {}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+            {"role": "system", "content": "Runtime tip"},
+            {"role": "assistant", "content": "Done"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages, self.ToolHistoryTokenizer()
+        )
+
+        assert result == messages
+
+    def test_preserves_tail_system_after_tool_when_exact_probe_passes(self):
+        messages = [
+            {"role": "user", "content": "Use the lookup tool"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "lookup", "arguments": {}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+            {"role": "system", "content": "Runtime tip"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages, self.ToolHistoryTokenizer()
+        )
+
+        assert result == messages
+
+    def test_falls_back_when_template_rejects_system_after_tool(self):
+        tokenizer = self.UserOnlyMidSystemTokenizer()
+        messages = [
+            {"role": "user", "content": "Use the lookup tool"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "lookup", "arguments": {}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+            {"role": "system", "content": "Runtime tip"},
+            {"role": "assistant", "content": "Done"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            tokenizer,
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert [message["role"] for message in result] == [
+            "system",
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+        ]
+        tokenizer.apply_chat_template(result)
 
     def test_merges_consecutive_tail_systems_in_place_when_preserved(self):
         messages = [
@@ -2527,6 +2663,23 @@ class TestPrepareSystemMessagesForTemplate:
 
         assert without_tools is False
         assert with_tools is True
+
+    def test_probe_cache_key_distinguishes_preceding_role(self):
+        tokenizer = self.UserOnlyMidSystemTokenizer()
+
+        after_user = chat_template_preserves_mid_system(
+            tokenizer,
+            preceding_role="user",
+            placement="between",
+        )
+        after_tool = chat_template_preserves_mid_system(
+            tokenizer,
+            preceding_role="tool",
+            placement="between",
+        )
+
+        assert after_user is True
+        assert after_tool is False
 
 
 class TestMergeConsecutiveRoles:

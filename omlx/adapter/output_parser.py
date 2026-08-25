@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -339,6 +340,86 @@ class BailingHybridOutputParserSession:
             tool_calls=tool_calls,
             finish_reason="tool_calls" if tool_calls else None,
         )
+
+
+def install_minimax_m3_tokenizer_protocol(
+    tokenizer: Any,
+    model_name: str,
+    model_config: dict[str, Any] | None = None,
+) -> bool:
+    """Install oMLX's MiniMax M3 protocol on any serving tokenizer wrapper.
+
+    Both the normal VLM engine and the distributed MLX-LM server use this
+    adapter. MLX-LM otherwise infers ``json_tools`` from MiniMax's template,
+    although the model emits namespaced XML, and recognizes ``<think>`` rather
+    than MiniMax's ``<mm:think>`` markers.
+
+    ``mlx_lm`` exposes these values as read-only properties backed by private
+    constructor fields; ``mlx_vlm`` exposes ordinary instance attributes.
+    Populate both representations so every oMLX serving lane shares the same
+    parser and marker contract.
+    """
+
+    if not _is_minimax_m3_model(model_name, model_config):
+        return False
+
+    from ..patches.mlx_vlm_minimax_m3_compat import (
+        apply_mlx_vlm_minimax_m3_compat_patch,
+    )
+
+    apply_mlx_vlm_minimax_m3_compat_patch()
+    from mlx_vlm.tool_parsers.minimax_m3 import (
+        parse_tool_call as parse_native_tool_call,
+    )
+
+    def parse_tool_call(text: str, tools: Any = None) -> Any:
+        parsed = parse_native_tool_call(text, tools)
+        calls = parsed if isinstance(parsed, list) else [parsed]
+        normalized: list[dict[str, Any]] = []
+        for call in calls:
+            if not isinstance(call, dict):
+                raise ValueError("MiniMax M3 tool parser returned a non-object call")
+            arguments = call.get("arguments", {})
+            if isinstance(arguments, str):
+                arguments = json.loads(arguments or "{}")
+            if not isinstance(arguments, dict):
+                raise ValueError("MiniMax M3 tool parser returned non-object arguments")
+            normalized.append(
+                {
+                    "name": str(call.get("name", "")),
+                    "arguments": arguments,
+                }
+            )
+        return normalized if isinstance(parsed, list) else normalized[0]
+
+    def encoded(marker: str) -> tuple[int, ...]:
+        tokens = tokenizer.encode(marker, add_special_tokens=False)
+        if not tokens:
+            raise RuntimeError(
+                f"MiniMax M3 protocol marker {marker!r} produced no tokens"
+            )
+        return tuple(int(token) for token in tokens)
+
+    values = {
+        "tool_parser": parse_tool_call,
+        "tool_call_start": _MINIMAX_TOOL_CALL_START,
+        "tool_call_end": _MINIMAX_TOOL_CALL_END,
+        "tool_call_start_tokens": encoded(_MINIMAX_TOOL_CALL_START),
+        "tool_call_end_tokens": encoded(_MINIMAX_TOOL_CALL_END),
+        "think_start": _MINIMAX_THINK_START,
+        "think_end": _MINIMAX_THINK_END,
+        "think_start_tokens": encoded(_MINIMAX_THINK_START),
+        "think_end_tokens": encoded(_MINIMAX_THINK_END),
+    }
+    for name, value in values.items():
+        setattr(tokenizer, f"_{name}", value)
+        # mlx_lm TokenizerWrapper exposes a read-only property.
+        with suppress(AttributeError, TypeError):
+            setattr(tokenizer, name, value)
+    for name in ("has_tool_calling", "has_thinking"):
+        with suppress(AttributeError, TypeError):
+            setattr(tokenizer, name, True)
+    return True
 
 
 class _MiniMaxM3ProtocolNormalizer:

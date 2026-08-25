@@ -54,7 +54,9 @@ def _fork_model():
     from dflash_mlx.models.muse_glimmer import Model, ModelArgs
 
     mx.random.seed(0)
-    return Model(ModelArgs(**_TINY_TEXT_KWARGS))
+    model = Model(ModelArgs(**_TINY_TEXT_KWARGS))
+    model.set_dtype(mx.bfloat16)
+    return model
 
 
 def _vendor_language_model():
@@ -67,7 +69,9 @@ def _vendor_language_model():
     from mlx_vlm.models.muse_glimmer.language import LanguageModel
 
     mx.random.seed(0)
-    return LanguageModel(TextConfig(rms_norm_eps=1e-5, **_TINY_TEXT_KWARGS))
+    model = LanguageModel(TextConfig(rms_norm_eps=1e-5, **_TINY_TEXT_KWARGS))
+    model.set_dtype(mx.bfloat16)
+    return model
 
 
 class TestCrossImplementationParity:
@@ -119,15 +123,10 @@ class TestCrossImplementationParity:
         assert bool(mx.allclose(logits, vendor_logits, atol=1e-5))
 
 
-class TestDraftNormalizerIndependence:
-    def test_muse_from_dict_works_with_omlx_wrapper_installed(self):
+class TestDraftConfig:
+    def test_muse_from_dict_supports_nested_rope_config(self):
         from dflash_mlx.models.muse_glimmer_draft import MuseGlimmerDraftModelArgs
 
-        from omlx.patches.dflash_draft_config import (
-            install_dflash_draft_config_normalizer,
-        )
-
-        install_dflash_draft_config_normalizer()
         args = MuseGlimmerDraftModelArgs.from_dict(
             {
                 "model_type": "muse_glimmer_assistant",

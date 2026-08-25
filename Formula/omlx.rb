@@ -3,8 +3,8 @@ class Omlx < Formula
 
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jundot/omlx"
-  url "https://github.com/jundot/omlx/archive/refs/tags/v0.5.7.tar.gz"
-  sha256 "6a69cdffa7ddeb7d2fbee235971ee025407bf0cc019a3a481f278320d31a1189"
+  url "https://github.com/jundot/omlx/archive/refs/tags/v0.6.3rc3.tar.gz"
+  sha256 "1d08ff4585eb796f34f56d266b69cae65b51a48d98a4b213caca094d7c82a839"
   license "Apache-2.0"
 
   head "https://github.com/jundot/omlx.git", branch: "main"
@@ -15,7 +15,7 @@ class Omlx < Formula
 
   depends_on "rust" => :build
   depends_on arch: :arm64
-  depends_on :macos
+  depends_on macos: :sequoia
   depends_on "python@3.11"
 
   # macOS 27 beta's `strip` corrupts dynamic offsets in Mach-O libraries

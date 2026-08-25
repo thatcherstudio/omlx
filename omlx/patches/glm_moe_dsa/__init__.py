@@ -77,6 +77,13 @@ def apply_glm_moe_dsa_patch() -> bool:
     from .generate_patch import apply_glm_moe_dsa_generate_patch
 
     apply_glm_moe_dsa_generate_patch()
+    # The DSA indexer is constructed fused (wk_weights_proj) while checkpoints
+    # store the unfused pair; sanitize() fuses at load time but sharded_load's
+    # weight-index gate runs before any weights are read and would reject a
+    # local checkpoint the normal loader handles fine.
+    from omlx.patches.mlx_lm_sharded_load import install_local_sharded_load_fallback
+
+    install_local_sharded_load_fallback()
     _APPLIED = True
     missing = _missing_fast_symbols()
     if missing:

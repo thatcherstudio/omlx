@@ -78,6 +78,8 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
+from omlx.prefill_progress import get_prefill_tracker
+
 from . import cache_rollback as _rollback_mod
 from . import prompt_priming as _prompt_priming
 
@@ -190,17 +192,27 @@ def apply() -> bool:
                         active = getattr(self, "_omlx_mtp_state", None)
                         if active is not None:
                             _reconcile_mtp_to_standard(self, active)
+                            if active.reentry_probe:
+                                try:
+                                    delattr(self, "_omlx_mtp_park_state")
+                                except AttributeError:
+                                    pass
                         _drop_mtp_state(self, "step-fallback")
             else:
                 _drop_mtp_state(self, "non-singleton-or-ineligible")
             _log_multirow_mtp_inactive_once(self)
             _mark_standard_multirow_decode(self)
-            if getattr(self, "_omlx_mtp_tax_probe", None) is not None:
+            tax_probe = getattr(self, "_omlx_mtp_tax_probe", None)
+            park_state = _mtp_park_state_for_batch(self)
+            if tax_probe is not None or park_state is not None:
                 step_t0 = time.perf_counter()
                 result = original_next(self, *args, **kwargs)
-                _record_std_tax_sample(
-                    self, (time.perf_counter() - step_t0) * 1000.0
-                )
+                if tax_probe is not None:
+                    _record_std_tax_sample(
+                        self, (time.perf_counter() - step_t0) * 1000.0
+                    )
+                if park_state is not None:
+                    _record_parked_standard_step(self)
                 return result
             return original_next(self, *args, **kwargs)
 
@@ -216,6 +228,10 @@ def apply() -> bool:
 
             host_state = getattr(self, "_omlx_mtp_state", None)
             if host_state is not None and _mtp_state_valid_for_batch(self, host_state):
+                if host_state.reentry_probe:
+                    park_state = _mtp_park_state_for_batch(self)
+                    if park_state is not None:
+                        park_state.defer_probe()
                 _reconcile_mtp_to_standard(self, host_state)
                 _drop_mtp_state(self, "extend-reconciled")
             result = original_extend(self, batch, *args, **kwargs)
@@ -240,6 +256,7 @@ def apply() -> bool:
                 old_uids=old_uids,
                 log_empty=True,
             )
+            _mtp_park_state_for_batch(self)
             return result
 
         GenerationBatch.__init__ = patched_init
@@ -376,15 +393,20 @@ def _singleton_mtp_handoff_ready(gen_batch: Any) -> bool:
 
 
 def _mtp_common_eligible(gen_batch: Any) -> bool:
-    parked_uid = getattr(gen_batch, "_omlx_mtp_parked_uid", None)
-    if parked_uid is not None and parked_uid in (getattr(gen_batch, "uids", None) or ()):
-        # This sequence already proved speculation loses to plain decoding
-        # (depth controller parked and handed off); do not re-activate it.
-        # Keyed by uid, not the batch object: GenerationBatch instances are
-        # reused across requests via extend() merges, and a bare flag would
-        # leak the park to whichever request joins the batch next. Once the
-        # parked uid leaves the batch the marker is stale and ignored.
-        return False
+    park_state = _mtp_park_state_for_batch(gen_batch)
+    if park_state is not None:
+        uids = getattr(gen_batch, "uids", None) or ()
+        active = getattr(gen_batch, "_omlx_mtp_state", None)
+        active_probe = bool(
+            active is not None
+            and getattr(active, "uid", None) == park_state.uid
+            and getattr(active, "reentry_probe", False)
+        )
+        # Performance parking is reversible, but re-entry is deliberately a
+        # singleton operation. Multi-row decode keeps using the standard path
+        # until the parked row is alone and its cache is activation-safe.
+        if len(uids) != 1 or (not active_probe and not park_state.probe_ready()):
+            return False
     if not hasattr(gen_batch, "model"):
         return False
     if not hasattr(gen_batch.model, "mtp_forward"):
@@ -730,6 +752,10 @@ class _MtpState:
     # drafts the next chain builds from rolling accept/latency estimates.
     controller: Optional[Any] = None
 
+    # True while this state is a bounded re-entry probe after a performance
+    # handoff. Correctness fallbacks and late-join handoffs do not set it.
+    reentry_probe: bool = False
+
     # Accept-rate / throughput counters. Surfaced via logger.info on finish.
     stats: _MtpStats = field(default_factory=_MtpStats)
 
@@ -739,6 +765,90 @@ class _MtpBatchState:
     """Experimental row-wise MTP state for a multi-sequence GenerationBatch."""
 
     states: Dict[Any, _MtpState] = field(default_factory=dict)
+
+
+# The existing depth controller decides whether a re-entry probe wins. This
+# policy state only schedules retries; it deliberately does not duplicate the
+# controller's acceptance and cycle-cost model.
+_MTP_REENTRY_INITIAL_COOLDOWN_TOKENS = 128
+_MTP_REENTRY_MAX_COOLDOWN_TOKENS = 4096
+
+
+@dataclass
+class _MtpParkState:
+    """Per-sequence policy state for reversible performance parking.
+
+    The MTP cache itself is dropped so the standard decoder regains its
+    pipelined fast path. This host-side record survives the handoff and admits
+    a later MTP probe. It is keyed by uid because GenerationBatch objects are
+    reused across requests.
+    """
+
+    uid: Any
+    cooldown_tokens: int = _MTP_REENTRY_INITIAL_COOLDOWN_TOKENS
+    tokens_remaining: int = _MTP_REENTRY_INITIAL_COOLDOWN_TOKENS
+
+    def observe_standard(self) -> None:
+        self.tokens_remaining = max(0, self.tokens_remaining - 1)
+
+    def probe_ready(self) -> bool:
+        return self.tokens_remaining <= 0 and not _prefill_activity_recent()
+
+    def restart_after_failed_probe(self) -> None:
+        self.cooldown_tokens = min(
+            _MTP_REENTRY_MAX_COOLDOWN_TOKENS,
+            self.cooldown_tokens * 2,
+        )
+        self.tokens_remaining = self.cooldown_tokens
+
+    def defer_probe(self) -> None:
+        """Yield a probe for a batch-shape handoff without penalizing it."""
+        self.tokens_remaining = 0
+
+
+def _mtp_park_state_for_batch(gen_batch: Any) -> Optional[_MtpParkState]:
+    state = getattr(gen_batch, "_omlx_mtp_park_state", None)
+    if state is None:
+        return None
+    uids = getattr(gen_batch, "uids", None) or ()
+    if state.uid in uids:
+        return state
+    try:
+        delattr(gen_batch, "_omlx_mtp_park_state")
+    except AttributeError:
+        pass
+    return None
+
+
+def _record_parked_standard_step(gen_batch: Any) -> None:
+    state = _mtp_park_state_for_batch(gen_batch)
+    if state is not None:
+        state.observe_standard()
+
+
+def _maybe_finish_mtp_reentry_probe(
+    gen_batch: Any,
+    state: _MtpState,
+    *,
+    was_warmup: bool,
+) -> bool:
+    """Clear the cooldown once the existing controller measures a win."""
+    controller = state.controller
+    if (
+        not state.reentry_probe
+        or controller is None
+        or was_warmup
+        or controller._warmup
+        or controller.exit_streak != 0
+    ):
+        return False
+    try:
+        delattr(gen_batch, "_omlx_mtp_park_state")
+    except AttributeError:
+        pass
+    state.reentry_probe = False
+    logger.info("MTP[%s] re-entry probe succeeded", state.uid)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1091,12 +1201,24 @@ def _prepare_mtp_state_for_next(gen_batch: Any) -> Optional[_MtpState]:
     if state is not None:
         _drop_mtp_state(gen_batch, "stale-owner")
 
+    park_state = _mtp_park_state_for_batch(gen_batch)
     _set_singleton_mrope_delta(gen_batch)
     _post_init_mtp(gen_batch)
     state = getattr(gen_batch, "_omlx_mtp_state", None)
     if not _mtp_state_valid_for_batch(gen_batch, state):
         _drop_mtp_state(gen_batch, "post-init-invalid")
         return None
+
+    # Eligibility already admitted this parked singleton. Mark the fresh
+    # state unconditionally so a prefill arriving between the two checks
+    # cannot strand the cooldown marker beside a normal MTP state.
+    if park_state is not None:
+        state.reentry_probe = True
+        logger.info(
+            "MTP[%s] re-entry probe started after %d standard tokens",
+            state.uid,
+            park_state.cooldown_tokens,
+        )
 
     logger.info(
         "MTP path activated for uid=%s (model has mtp_forward, batch=1, primed=%d)",
@@ -1190,6 +1312,10 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
             next_lp = next_lp_2d.squeeze(0)
 
         mx.eval(next_tok)
+        # Reconciliation produces committed standard-decoding state. A long
+        # re-prefill is still an armed MTP-managed backbone call, so discard
+        # its speculative snapshots before exposing or merging the cache.
+        _clear_rollback(new_cache)
         gen_batch.prompt_cache = new_cache
         gen_batch._next_tokens = next_tok
         gen_batch._next_logprobs = [next_lp]
@@ -1215,6 +1341,33 @@ def _apply_processors(processors, prev_tokens, logits_2d):
     for proc in processors:
         logits_2d = proc(prev_tokens, logits_2d)
     return logits_2d
+
+
+def _snap_snapshotable(procs):
+    """Checkpoint state of processors exposing ``snapshot_state`` (budget).
+
+    Returns ``None`` when no processor supports position-keyed rewind, so
+    callers can skip the restore unconditionally (the DSpark path applies
+    processors to speculative draft positions; only the budget processor
+    tracks position-sensitive mutable state today).
+    """
+    if not procs:
+        return None
+    snaps = [p.snapshot_state() for p in procs if hasattr(p, "snapshot_state")]
+    return snaps or None
+
+
+def _restore_snapshotable(procs, snaps) -> None:
+    """Rewind processors previously checkpointed by :func:`_snap_snapshotable`."""
+    if not procs or not snaps:
+        return
+    it = iter(snaps)
+    for p in procs:
+        if hasattr(p, "restore_state"):
+            try:
+                p.restore_state(next(it))
+            except StopIteration:
+                return
 
 
 def _logprobs(logits_2d):
@@ -1535,18 +1688,43 @@ _STD_TAX_SKIP = 2  # first post-hand-off steps still carry transition costs
 _STD_TAX_SAMPLES = 8
 _STD_TAX_EMA = 0.5
 _STD_TAX_MAX = 1.5
+# Cycle timings sampled while another request is prefilling (any engine on
+# the shared GPU) are contention-shaped, not loop-shaped. A park probe armed
+# or finalized in that window latches a poisoned t0/t_std ratio on the model
+# and depresses MTP for every later sequence (#2622).
+_STD_TAX_CONTENTION_WINDOW_S = 3.0
+_STD_TAX_WARN = 1.3  # a stored tax at/above this is worth an INFO line
+_STD_TAX_DECAY_S = 600.0  # stale latch decays toward the default margin
+
+
+def _prefill_activity_recent() -> bool:
+    try:
+        return get_prefill_tracker().recently_active(
+            _STD_TAX_CONTENTION_WINDOW_S
+        )
+    except Exception:
+        return False
 
 
 def _arm_std_tax_probe(
     gen_batch: Any, t0_ms: Optional[float], uid: Any = None
 ) -> None:
-    if t0_ms and t0_ms > 0.0:
-        gen_batch._omlx_mtp_tax_probe = {
-            "t0": float(t0_ms),
-            "skip": _STD_TAX_SKIP,
-            "samples": [],
-            "uid": uid,
-        }
+    if not (t0_ms and t0_ms > 0.0):
+        return
+    if _prefill_activity_recent():
+        logger.debug(
+            "MTP loop-tax probe skipped: prefill activity within %.1fs, "
+            "t0=%.1fms is contention-contaminated",
+            _STD_TAX_CONTENTION_WINDOW_S,
+            t0_ms,
+        )
+        return
+    gen_batch._omlx_mtp_tax_probe = {
+        "t0": float(t0_ms),
+        "skip": _STD_TAX_SKIP,
+        "samples": [],
+        "uid": uid,
+    }
 
 
 def _record_std_tax_sample(gen_batch: Any, duration_ms: float) -> None:
@@ -1576,6 +1754,12 @@ def _record_std_tax_sample(gen_batch: Any, duration_ms: float) -> None:
     t_std = samples[len(samples) // 2]
     if t_std <= 0.0:
         return
+    if _prefill_activity_recent():
+        logger.debug(
+            "MTP loop-tax probe discarded: prefill activity during the "
+            "std sampling window"
+        )
+        return
     tax = min(_STD_TAX_MAX, max(1.0, probe["t0"] / t_std))
     model = getattr(gen_batch, "model", None)
     if model is None:
@@ -1585,14 +1769,36 @@ def _record_std_tax_sample(gen_batch: Any, duration_ms: float) -> None:
         tax = (1.0 - _STD_TAX_EMA) * float(prev) + _STD_TAX_EMA * tax
     try:
         model._omlx_mtp_loop_tax = tax
+        model._omlx_mtp_loop_tax_ts = time.monotonic()
     except Exception:
         return
-    logger.debug(
+    log = logger.info if tax >= _STD_TAX_WARN else logger.debug
+    log(
         "MTP loop tax measured: %.3f (parked t0=%.1fms, std step=%.1fms)",
         tax,
         probe["t0"],
         t_std,
     )
+
+
+def _effective_loop_tax(model: Any) -> Optional[float]:
+    """Measured loop tax, decayed toward the default exit margin with age.
+
+    A genuine loop tax is stable and re-latches through fresh park probes,
+    so decay costs nothing in the steady state. A high value that stopped
+    being reproduced — the signature of a probe that sampled around a
+    contention episode despite the arm/finalize guards — must not depress
+    MTP until the next restart (#2622).
+    """
+    tax = getattr(model, "_omlx_mtp_loop_tax", None)
+    if tax is None:
+        return None
+    ts = getattr(model, "_omlx_mtp_loop_tax_ts", None)
+    if ts is None:
+        return float(tax)
+    age = max(0.0, time.monotonic() - float(ts))
+    prior = float(_DepthController.EXIT_MARGIN)
+    return prior + (float(tax) - prior) * math.exp(-age / _STD_TAX_DECAY_S)
 
 
 class _DepthController:
@@ -1714,8 +1920,8 @@ class _DepthController:
         # the baseline the exit decision compares against, is data-driven
         # within max_depth + 3 cycles. The baseline gets extra samples
         # because it may never be selected again (no refresh path), and
-        # the one-way exit decision must not hang on a single first-run
-        # sample; plain-step warmup cycles cost almost nothing.
+        # a performance handoff must not hang on a single first-run sample;
+        # plain-step warmup cycles cost almost nothing.
         self._warmup: List[int] = list(range(self.max_depth, 0, -1))
         if self.max_depth > 1:
             self._warmup.extend([0, 0, 0])
@@ -2045,6 +2251,12 @@ def _dspark_next_drafts(
     draft_accept_lps: List[Any] = []
     previous = anchor.reshape(1)
 
+    # Drafts are speculative — processor calls shape the draft
+    # distribution but must not advance the thinking budget (they would
+    # count tokens that are only emitted if verified later). Checkpoint
+    # before the loop and rewind after.
+    snap = _snap_snapshotable(procs)
+
     for idx in range(depth):
         bias, _ = host.dspark_markov(previous)
         logits_2d = logits[:, idx, :] + bias
@@ -2060,6 +2272,8 @@ def _dspark_next_drafts(
         draft_lps.append(lp_2d.squeeze(0))
         draft_accept_lps.append(_accept_lp_for(sampler, lp_2d).squeeze(0))
         previous = token.reshape(1)
+
+    _restore_snapshotable(procs, snap)
 
     state.drafts = mx.concatenate(draft_toks)
     state.draft_lps = draft_lps
@@ -2157,6 +2371,10 @@ def _chain_next_drafts(
     chain_cache = state.mtp_cache
     if state.head_clone and depth > 1:
         chain_cache = _clone_mtp_head_cache(state.mtp_cache)
+
+    # Speculative draft shaping — see _dspark_next_drafts.
+    snap = _snap_snapshotable(procs)
+
     for j in range(depth):
         logits_2d = logits[:, -1, :]
         if procs is not None and prev_buf is not None:
@@ -2179,6 +2397,8 @@ def _chain_next_drafts(
             return_hidden=True,
         )
         h = head_hidden[:, -1:]
+
+    _restore_snapshotable(procs, snap)
 
     if draft_toks:
         state.drafts = mx.concatenate(draft_toks)
@@ -2268,9 +2488,7 @@ def _post_init_mtp(gen_batch: Any) -> None:
                 marginal_ms=getattr(
                     gen_batch.model, "_omlx_mtp_marginal_ms", None
                 ),
-                exit_margin=getattr(
-                    gen_batch.model, "_omlx_mtp_loop_tax", None
-                ),
+                exit_margin=_effective_loop_tax(gen_batch.model),
             )
         primed = _prompt_priming.take_primed(
             gen_batch.model, gen_batch.prompt_cache, main_tok
@@ -2304,11 +2522,14 @@ def _post_init_mtp(gen_batch: Any) -> None:
     next_ids = next_main_tok.reshape(1, 1)
     mtp_logits = gen_batch.model.mtp_forward(hidden_at_main, next_ids, mtp_cache)
     mtp_logits_2d = mtp_logits[:, -1, :]
+    # The seed draft is speculative — shape but do not count.
+    snap = _snap_snapshotable(procs)
     if procs is not None:
         prev_with_main_and_next = mx.concatenate(
             [prev_buf, _ensure_uint32(next_main_tok)]
         )
         mtp_logits_2d = _apply_processors(procs, prev_with_main_and_next, mtp_logits_2d)
+    _restore_snapshotable(procs, snap)
     draft_lp_2d = _logprobs(mtp_logits_2d)
     draft_tok = sampler(draft_lp_2d)
     # Filtered draft lp — what the sampler actually drew from. The next
@@ -2496,15 +2717,25 @@ def _park_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
     unlike ``_reconcile_mtp_to_standard`` no re-prefill is needed: feed
     ``state.next_main`` (already streamed, not yet in the cache), sample its
     successor as ``_next_tokens``, and drop the MTP state. The batch is
-    marked so eligibility never re-activates MTP — the controller already
-    proved speculation loses here, and the standard step's async pipelining
-    is what the parked cycles cannot match.
+    marked for a cooldown so the standard step's async pipelining can run
+    without the MTP loop tax. A later singleton probe creates a fresh depth
+    controller; repeated failed probes exponentially extend the cooldown.
     """
     if not _feed_next_main_to_standard(gen_batch, state):
         return False
-    gen_batch._omlx_mtp_parked_uid = state.uid
+    park_state = _mtp_park_state_for_batch(gen_batch)
+    if state.reentry_probe and park_state is not None:
+        park_state.restart_after_failed_probe()
+    else:
+        park_state = _MtpParkState(uid=state.uid)
+        gen_batch._omlx_mtp_park_state = park_state
     if state.controller is not None:
         _arm_std_tax_probe(gen_batch, state.controller.t.get(0), state.uid)
+    logger.info(
+        "MTP[%s] parked for %d standard tokens before re-entry probe",
+        state.uid,
+        park_state.cooldown_tokens,
+    )
     state._finish_reason = "parked"
     _drop_mtp_state(gen_batch, "parked-at-depth-0", log_stats=True)
     return True
@@ -2520,10 +2751,10 @@ def _handoff_mtp_for_late_join(gen_batch: Any, state: _MtpState) -> bool:
     from the cache, so it becomes ``_next_tokens`` verbatim and its stored
     logprobs keep the standard step's emission byte-identical; with an
     empty queue the park-style 1-token forward re-derives the same state.
-    Unlike ``_park_mtp_to_standard`` this sets no parked uid and arms no
-    std-tax probe: the sequence is yielding to a batch merge, not losing to
-    standard decode, and must regain MTP once it is a compact singleton
-    again.
+    Unlike ``_park_mtp_to_standard`` this starts no performance cooldown and
+    arms no std-tax probe: the sequence is yielding to a batch merge, not
+    losing to standard decode, and must regain MTP once it is a compact
+    singleton again.
     """
     import mlx.core as mx
 
@@ -2536,6 +2767,10 @@ def _handoff_mtp_for_late_join(gen_batch: Any, state: _MtpState) -> bool:
         _clear_rollback(gen_batch.prompt_cache)
     elif not _feed_next_main_to_standard(gen_batch, state):
         return False
+    if state.reentry_probe:
+        park_state = _mtp_park_state_for_batch(gen_batch)
+        if park_state is not None:
+            park_state.defer_probe()
     state._finish_reason = "late-join-handoff"
     _drop_mtp_state(gen_batch, "late-join-handoff", log_stats=True)
     return True
@@ -2690,13 +2925,19 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         n_confirmed=1,
     )
     rows = logits[0]  # (k+1, vocab)
+    row_snaps: List[Optional[Any]] = [None] * (k + 1)
     if procs is not None:
-        rows = mx.stack(
-            [
+        applied = []
+        for j in range(k + 1):
+            applied.append(
                 _apply_processors(procs, prev_rows[j], rows[j : j + 1]).squeeze(0)
-                for j in range(k + 1)
-            ]
-        )
+            )
+            # Checkpoint after each row: rows 0..m correspond to the m+1
+            # tokens actually emitted this cycle (m accepted drafts + the
+            # bonus/verify correction). Rows m+1..k are speculative — they
+            # predict rejected drafts and are re-verified next cycle.
+            row_snaps[j] = _snap_snapshotable(procs)
+        rows = mx.stack(applied)
     combined_lp = rows - mx.logsumexp(rows, axis=-1, keepdims=True)  # (k+1, V)
 
     if k == 0:
@@ -2800,6 +3041,16 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         emit_last_id = draft_ids[m]
         emit_last_lp = combined_lp[m]
 
+    # Rewind budget-capable processors to the last emitted position.
+    # Rows 0..m produced the m+1 emitted tokens (m accepted drafts + the
+    # bonus/verify correction); rows m+1..k predicted rejected drafts that
+    # are re-verified next cycle, so their processor calls must be undone
+    # (they would over-count the thinking budget / corrupt state). Mirrors
+    # MTPProcessingSampler's position-keyed snapshot/restore on vlm_mtp.
+    # Uses the FINAL m (after the model clamp and boundary alignment above).
+    if m < k and row_snaps[m] is not None:
+        _restore_snapshotable(procs, row_snaps[m])
+
     # A clamp can put the final verify token on the boundary, while a full
     # accept can put its bonus token there. Neither token is present in the
     # backbone cache yet, so materialize it before the queue reaches it.
@@ -2859,6 +3110,7 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
     if materialize_boundary_emit:
         _materialize_mtp_boundary_emit(gen_batch, state)
     if state.controller is not None:
+        was_warmup = bool(state.controller._warmup)
         keepalive = bool(getattr(state.mtp_cache, "fold_keepalive", False))
         if keepalive:
             state.mtp_cache.fold_keepalive = False
@@ -2867,6 +3119,11 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
             m,
             (time.perf_counter() - cycle_t0) * 1000,
             time_sample=not keepalive,
+        )
+        _maybe_finish_mtp_reentry_probe(
+            gen_batch,
+            state,
+            was_warmup=was_warmup,
         )
 
 
@@ -3003,8 +3260,12 @@ def _run_verify_cycle_legacy(gen_batch: Any, state: _MtpState) -> None:
     state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
+    verify_snap = None
     if procs is not None:
         verify_logits = _apply_processors(procs, prev_main, verify_logits)
+        # Checkpoint after the verify row: it produced the one token that is
+        # ALWAYS emitted (draft on accept, verify correction on reject).
+        verify_snap = _snap_snapshotable(procs)
         bonus_logits = _apply_processors(procs, prev_draft, bonus_logits)
     # Batched logprobs: one logsumexp over (2, vocab) instead of two over
     # (1, vocab). Shaves one reduction per cycle on the vocab dimension.
@@ -3084,6 +3345,11 @@ def _run_verify_cycle_legacy(gen_batch: Any, state: _MtpState) -> None:
     # Reject path.
     state.stats.rejects += 1
     t0 = time.perf_counter()
+    # The bonus row's processor call was speculative (its token is not
+    # emitted on reject) — rewind to the verify-row checkpoint. Mirrors the
+    # chain cycle's restore-on-partial-accept.
+    if procs is not None and verify_snap is not None:
+        _restore_snapshotable(procs, verify_snap)
     # accepted=0 means only the confirmed token (verify position) is kept;
     # block_size=2 covers both the confirmed and the rejected draft.
     if not _rollback_after_reject(
@@ -3160,9 +3426,12 @@ def _step_mtp(
         hidden_at_position, next_ids, state.mtp_cache
     )
     mtp_logits_2d = mtp_logits[:, -1, :]
+    # The draft is speculative — shape it but do not advance the budget.
+    snap = _snap_snapshotable(procs)
     if procs is not None and prev_buf is not None:
         prev_with_next = mx.concatenate([prev_buf, _ensure_uint32(next_main_tok)])
         mtp_logits_2d = _apply_processors(procs, prev_with_next, mtp_logits_2d)
+    _restore_snapshotable(procs, snap)
     new_lp = _logprobs(mtp_logits_2d)
     new_tok = sampler(new_lp)
     # Filtered draft lp — what the sampler actually drew from. The next

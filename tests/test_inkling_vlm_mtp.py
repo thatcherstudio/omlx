@@ -15,6 +15,17 @@ except ImportError:
 pytestmark = pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 
 
+@pytest.fixture()
+def strict_math_device():
+    """Use deterministic CPU reductions for chunk-shape parity assertions."""
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        yield
+    finally:
+        mx.set_default_device(previous)
+
+
 @pytest.fixture(scope="module")
 def runtime():
     from omlx.patches.mlx_lm_mtp import set_mtp_active, set_mtp_depth
@@ -224,7 +235,7 @@ def test_variable_depth_lag_heals(runtime):
         assert dk < 1e-4, f"block {j} did not heal after depth dip: {dk}"
 
 
-def test_verify_rollback_matches_sequential_decode(runtime):
+def test_verify_rollback_matches_sequential_decode(runtime, strict_math_device):
     """Rolling back a rejected verify chunk must leave the backbone cache
     equivalent to having decoded only the accepted tokens one by one."""
     model = _mtp_language_model()

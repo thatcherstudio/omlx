@@ -23,6 +23,17 @@ except ImportError:
 pytestmark = pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 
 
+@pytest.fixture()
+def strict_math_device():
+    """Use deterministic CPU reductions for compact/padded KV parity."""
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        yield
+    finally:
+        mx.set_default_device(previous)
+
+
 @pytest.fixture(scope="module")
 def applied():
     from omlx.patches.mlx_vlm_inkling_compat import (
@@ -356,7 +367,7 @@ def test_dense_intermediate_size_required(applied):
         LanguageModel(config)
 
 
-def test_batched_right_padded_prefill_parity(applied):
+def test_batched_right_padded_prefill_parity(applied, strict_math_device):
     """G2: a short request prefILLED inside a right-padded batch must end
     with the same conv states and next-token logits as the same request
     run alone. Without the vendored conv_mask / lengths-aware state /

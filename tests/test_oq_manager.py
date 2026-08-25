@@ -2,6 +2,7 @@
 """Tests for the OQManager admin component."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -317,9 +318,7 @@ class TestOQManagerAssistantCombine:
         assert manager._tasks == {}
 
     @pytest.mark.asyncio
-    async def test_run_invokes_combine_after_quantization(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_run_invokes_combine_after_quantization(self, tmp_path, monkeypatch):
         root = tmp_path / "models"
         root.mkdir()
         base = self._write_gemma4_base(root)
@@ -630,3 +629,162 @@ class TestOQManagerEnhanced:
         assert task.output_name == "Llama-3B-oQ4e"
         assert ".oqe_imatrix" in task.imatrix_cache_path
         assert task.imatrix_cache_path.endswith("-s8-l128.npz")
+
+
+class TestOQManagerHfCacheDiscovery:
+    """HF cache models (non-MLX) should appear as quantization sources."""
+
+    @pytest.mark.asyncio
+    async def test_hf_cache_model_is_available_for_quantization(self, tmp_path):
+        """Models stored in HF Hub cache layout should be discoverable
+        for oQ quantization, even when they are non-MLX PyTorch checkpoints."""
+        hf_cache = tmp_path / "hf_cache"
+        # Create HF cache layout: models--Org--Repo/snapshots/<hash>/
+        hf_entry = hf_cache / "models--Org--MyModel"
+        snapshots = hf_entry / "snapshots"
+        commit_hash = "abc123def456"
+        model_dir = snapshots / commit_hash
+        model_dir.mkdir(parents=True)
+        (model_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "llama",
+                    "num_hidden_layers": 32,
+                    "hidden_size": 4096,
+                }
+            )
+        )
+        (model_dir / "model.safetensors").write_bytes(b"\x00" * 4096)
+        # Create refs/main to point to the commit hash
+        refs = hf_entry / "refs"
+        refs.mkdir()
+        (refs / "main").write_text(commit_hash)
+
+        manager = OQManager(model_dirs=[str(hf_cache)])
+        source_models, all_models = await manager.list_quantizable_models()
+
+        assert len(source_models) == 1
+        assert source_models[0]["name"] == "Org--MyModel"
+        assert source_models[0]["source_repo_id"] == "Org/MyModel"
+        assert commit_hash in source_models[0]["path"]
+        assert source_models[0]["num_layers"] == 32
+
+    @pytest.mark.asyncio
+    async def test_hf_cache_quantization_uses_repo_identity(
+        self, tmp_path, monkeypatch
+    ):
+        output_dir = tmp_path / "models"
+        output_dir.mkdir()
+        hf_cache = tmp_path / "hf_cache"
+        hf_entry = hf_cache / "models--Org--MyModel"
+        commit_hash = "abc123def456"
+        model_dir = hf_entry / "snapshots" / commit_hash
+        model_dir.mkdir(parents=True)
+        (model_dir / "config.json").write_text(
+            json.dumps({"model_type": "llama", "num_hidden_layers": 32})
+        )
+        (model_dir / "model.safetensors").write_bytes(b"\x00" * 4096)
+
+        manager = OQManager(model_dirs=[str(output_dir), str(hf_cache)])
+
+        async def _noop_run(task_id):
+            return None
+
+        monkeypatch.setattr(manager, "_run_quantization", _noop_run)
+        source_models, _ = await manager.list_quantizable_models()
+        assert [model["name"] for model in source_models] == ["Org--MyModel"]
+
+        task = await manager.start_quantization(
+            source_models[0]["path"],
+            4,
+            enhanced=True,
+            imatrix_num_samples=8,
+            imatrix_seq_length=128,
+        )
+        await manager._active_tasks[task.task_id]
+
+        assert task.model_name == "Org/MyModel"
+        # Output name must use the bare repo name (no double-dash org prefix):
+        # huggingface_hub rejects repo_ids containing "--" on upload.
+        assert task.output_name == "MyModel-oQ4e"
+        assert Path(task.output_path) == output_dir / "MyModel-oQ4e"
+        imatrix_path = Path(task.imatrix_cache_path)
+        assert imatrix_path.parent == output_dir / ".oqe_imatrix"
+        assert imatrix_path.name.startswith("MyModel-")
+
+    @pytest.mark.asyncio
+    async def test_hf_cache_excludes_bin_only_checkpoint(self, tmp_path):
+        hf_cache = tmp_path / "hf_cache"
+        hf_entry = hf_cache / "models--Org--BinOnly"
+        commit_hash = "abc123"
+        model_dir = hf_entry / "snapshots" / commit_hash
+        model_dir.mkdir(parents=True)
+        (model_dir / "config.json").write_text(
+            json.dumps({"model_type": "llama", "num_hidden_layers": 32})
+        )
+        (model_dir / "pytorch_model.bin").write_bytes(b"\x00" * 4096)
+        refs = hf_entry / "refs"
+        refs.mkdir()
+        (refs / "main").write_text(commit_hash)
+
+        manager = OQManager(model_dirs=[str(hf_cache)])
+        source_models, all_models = await manager.list_quantizable_models()
+
+        assert source_models == []
+        assert all_models == []
+        with pytest.raises(ValueError, match=r"No \.safetensors files found"):
+            await manager.start_quantization(str(model_dir), 4)
+        assert manager._tasks == {}
+
+    @pytest.mark.asyncio
+    async def test_hf_cache_fallback_without_refs(self, tmp_path):
+        """HF cache entry without refs/main should still be discovered
+        via the latest-by-mtime fallback."""
+        hf_cache = tmp_path / "hf_cache"
+        hf_entry = hf_cache / "models--Meta--Llama"
+        snapshots = hf_entry / "snapshots"
+        commit_hash = "deadbeef"
+        model_dir = snapshots / commit_hash
+        model_dir.mkdir(parents=True)
+        (model_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "llama",
+                    "num_hidden_layers": 16,
+                }
+            )
+        )
+        (model_dir / "model.safetensors").write_bytes(b"\x00" * 4096)
+        # No refs/main file — fallback to latest snapshot by mtime
+
+        manager = OQManager(model_dirs=[str(hf_cache)])
+        source_models, _ = await manager.list_quantizable_models()
+
+        assert len(source_models) == 1
+        assert source_models[0]["name"] == "Meta--Llama"
+        assert source_models[0]["source_repo_id"] == "Meta/Llama"
+
+    @pytest.mark.asyncio
+    async def test_hf_cache_excludes_models_without_model_type(self, tmp_path):
+        """HF cache models without model_type in config should be excluded
+        because MLX cannot resolve the model class for quantization."""
+        hf_cache = tmp_path / "hf_cache"
+        hf_entry = hf_cache / "models--Org--NoType"
+        snapshots = hf_entry / "snapshots"
+        commit_hash = "abc123"
+        model_dir = snapshots / commit_hash
+        model_dir.mkdir(parents=True)
+        # Config with no model_type
+        (model_dir / "config.json").write_text(
+            json.dumps({"architectures": ["LlamaForCausalLM"]})
+        )
+        (model_dir / "model.safetensors").write_bytes(b"\x00" * 4096)
+        refs = hf_entry / "refs"
+        refs.mkdir()
+        (refs / "main").write_text(commit_hash)
+
+        manager = OQManager(model_dirs=[str(hf_cache)])
+        source_models, all_models = await manager.list_quantizable_models()
+
+        assert len(source_models) == 0
+        assert len(all_models) == 0

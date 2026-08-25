@@ -93,6 +93,42 @@ class TestSSEKeepaliveExceptionHandling:
         error_items = [i for i in items if i.startswith("data: {")]
         assert len(error_items) == 0
 
+    @pytest.mark.asyncio
+    async def test_fast_stream_disconnect_closes_upstream_generator(self):
+        """Fast tokens must not bypass disconnect polling indefinitely."""
+        closed = asyncio.Event()
+
+        async def gen():
+            try:
+                while True:
+                    yield "data: token\n\n"
+            finally:
+                closed.set()
+
+        class Request:
+            def __init__(self):
+                self.checks = 0
+
+            async def is_disconnected(self):
+                self.checks += 1
+                return self.checks > 1
+
+        request = Request()
+        items = await asyncio.wait_for(
+            _collect(
+                _with_sse_keepalive(
+                    gen(),
+                    http_request=request,
+                    disconnect_poll=0.0,
+                )
+            ),
+            timeout=1.0,
+        )
+
+        assert items[0] == ": keep-alive\n\n"
+        assert request.checks == 2
+        assert closed.is_set()
+
 
 class TestKeepaliveChunkFormats:
     """Tests for protocol-aware keepalive chunk emission."""

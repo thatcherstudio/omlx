@@ -10,6 +10,7 @@ This module provides OpenAI-compatible audio endpoints:
 
 import asyncio
 import base64
+import contextlib
 import io
 import json
 import logging
@@ -20,7 +21,15 @@ import tempfile
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import (
+    APIRouter,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import Response, StreamingResponse
 
 from ..engine.audio_utils import wav_bytes_to_pcm_frames, wav_header
@@ -30,6 +39,13 @@ from .audio_models import AudioSpeechRequest, AudioTranscriptionResponse
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Separate router for the realtime WebSocket: the main audio router is
+# mounted with an HTTP-only verify_api_key dependency that cannot resolve
+# in a websocket scope (and browsers cannot set an Authorization header on
+# WebSocket connections anyway). Auth happens in-band via the first
+# {"type": "start"} message instead.
+realtime_router = APIRouter()
 
 # Maximum upload size for audio files (100 MB).
 MAX_AUDIO_UPLOAD_BYTES = 100 * 1024 * 1024
@@ -580,6 +596,172 @@ async def create_transcription(
         duration=result.get("duration"),
         segments=segments,
     )
+
+
+def _verify_ws_api_key(api_key: Optional[str]) -> bool:
+    """Verify an in-band API key with the same rules as verify_api_key.
+
+    WebSocket connections from browsers cannot carry an Authorization
+    header, so the key arrives inside the {"type": "start"} message.
+    """
+    from omlx.server import _server_state
+
+    if _server_state.api_key is None:
+        return True
+    gs = _server_state.global_settings
+    if gs is not None and gs.auth.skip_api_key_verification:
+        return True
+    if not api_key:
+        return False
+
+    from omlx.admin.auth import verify_any_api_key
+
+    sub_keys = gs.auth.sub_keys if gs is not None else []
+    return verify_any_api_key(api_key, _server_state.api_key, sub_keys)
+
+
+@realtime_router.websocket("/v1/audio/transcriptions/realtime")
+async def realtime_transcription(websocket: WebSocket) -> None:
+    """Push-based realtime transcription over WebSocket.
+
+    Protocol:
+      client → {"type": "start", "model": ..., "api_key": ..., "language"?: ...}
+      server → {"type": "ready"} or {"type": "error", "detail": ...}
+      client → binary frames: 16 kHz mono little-endian Int16 PCM
+      server → {"type": "transcript.delta", "delta": ...} as text commits
+      client → {"type": "stop"} (or closes the socket to abandon)
+      server → remaining deltas, then {"type": "transcript.done", "text": ...}
+    """
+    await websocket.accept()
+
+    async def _reject(detail: str, close_code: int = 1008) -> None:
+        with contextlib.suppress(Exception):
+            await websocket.send_json({"type": "error", "detail": detail})
+            await websocket.close(code=close_code)
+
+    try:
+        start = await asyncio.wait_for(websocket.receive_json(), timeout=10.0)
+    except asyncio.TimeoutError:
+        await _reject("Handshake timeout")
+        return
+    except WebSocketDisconnect:
+        return
+    except Exception:
+        await _reject("Invalid handshake message")
+        return
+
+    if not isinstance(start, dict) or start.get("type") != "start":
+        await _reject("First message must be a {'type': 'start'} object")
+        return
+    if not _verify_ws_api_key(start.get("api_key")):
+        await _reject("Invalid API key")
+        return
+    model_id = start.get("model")
+    if not model_id or not isinstance(model_id, str):
+        await _reject("Missing 'model' in start message")
+        return
+    language = start.get("language") or None
+
+    resolved_model = _resolve_model(model_id)
+    try:
+        pool = _get_engine_pool()
+    except HTTPException as exc:
+        await _reject(str(exc.detail))
+        return
+    try:
+        engine = await pool.get_engine(resolved_model)
+    except Exception as exc:
+        await _reject(f"Failed to load model '{model_id}': {exc}")
+        return
+
+    from ..engine.stt import STTEngine
+
+    if not isinstance(engine, STTEngine):
+        await _reject(
+            f"Model '{model_id}' is not a speech-to-text model. "
+            "Realtime transcription requires an audio_stt model."
+        )
+        return
+    if not engine.supports_realtime_stt():
+        await _reject(
+            f"Model '{model_id}' does not support realtime transcription. "
+            "Use POST /v1/audio/transcriptions with a complete audio file."
+        )
+        return
+    try:
+        session = await engine.create_realtime_session(language=language)
+    except RuntimeError as exc:
+        await _reject(str(exc))
+        return
+
+    stop_event = asyncio.Event()
+    client_gone = False
+
+    async def _receiver() -> None:
+        nonlocal client_gone
+        while not stop_event.is_set():
+            try:
+                message = await websocket.receive()
+            except (WebSocketDisconnect, RuntimeError):
+                client_gone = True
+                stop_event.set()
+                return
+            if message.get("type") == "websocket.disconnect":
+                client_gone = True
+                stop_event.set()
+                return
+            data = message.get("bytes")
+            if data:
+                session.feed_pcm16(data)
+                continue
+            text = message.get("text")
+            if text:
+                try:
+                    payload = json.loads(text)
+                except ValueError:
+                    continue
+                if isinstance(payload, dict) and payload.get("type") == "stop":
+                    stop_event.set()
+                    return
+
+    full_text: list[str] = []
+
+    async def _send_deltas(deltas: list[str]) -> None:
+        for delta in deltas:
+            full_text.append(delta)
+            await websocket.send_json({"type": "transcript.delta", "delta": delta})
+
+    receiver = asyncio.create_task(_receiver())
+    try:
+        await websocket.send_json({"type": "ready"})
+        while not stop_event.is_set():
+            deltas = await session.poll()
+            if deltas:
+                await _send_deltas(deltas)
+            else:
+                # No committed text this round — wait briefly for more audio
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(stop_event.wait(), timeout=0.1)
+        if not client_gone:
+            deltas = await session.close()
+            await _send_deltas(deltas)
+            await websocket.send_json(
+                {"type": "transcript.done", "text": "".join(full_text)}
+            )
+            await websocket.close(code=1000)
+        _record_audio_request(resolved_model)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.exception("Realtime transcription failed for %s", resolved_model)
+        with contextlib.suppress(Exception):
+            await websocket.send_json({"type": "error", "detail": str(exc)})
+            await websocket.close(code=1011)
+    finally:
+        receiver.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await receiver
+        await session.release()
 
 
 @router.get("/v1/audio/voices")

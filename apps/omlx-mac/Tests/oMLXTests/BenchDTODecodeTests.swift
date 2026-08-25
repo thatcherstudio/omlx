@@ -39,6 +39,8 @@ final class BenchDTODecodeTests: XCTestCase {
         let request = BenchStartRequest(
             modelId: "model",
             contextProfile: .novelKorean,
+            warmupMode: .ane2048,
+            alignPromptToAne: true,
             promptLengths: [1024],
             generationLength: 128,
             batchSizes: [2]
@@ -50,12 +52,16 @@ final class BenchDTODecodeTests: XCTestCase {
                 as? [String: Any]
         )
         XCTAssertEqual(object["context_profile"] as? String, "novel_ko")
+        XCTAssertEqual(object["warmup_mode"] as? String, "ane_2048")
+        XCTAssertEqual(object["align_prompt_to_ane"] as? Bool, true)
     }
 
     @MainActor
     func testThroughputContextDefaultsToPythonCode() {
         let vm = ThroughputBenchScreenVM()
         XCTAssertEqual(vm.contextProfile, .codePython)
+        XCTAssertEqual(vm.warmupMode, .quick)
+        XCTAssertFalse(vm.alignPromptToAne)
         XCTAssertTrue(vm.exportText.hasPrefix("# Context: Code (Python)"))
     }
 

@@ -149,6 +149,34 @@ class TestMemoryMonitor:
         expected = 64 * 8 * 128 * 2 * 2 * 32
         assert estimate == expected
 
+    def test_estimate_block_memory_uses_kv_cache_layers(self):
+        """Hybrid recurrent layers do not add per-token KV bytes."""
+        monitor = MemoryMonitor(max_kv_cache_memory=1024**3)
+        monitor.set_model_info(
+            num_layers=64,
+            num_kv_heads=4,
+            head_dim=256,
+            dtype_size=2,
+            num_kv_cache_layers=16,
+        )
+
+        # 16 KV-cache layers × K/V × 4 heads × 256 values × 2 bytes × 64
+        # tokens = 4 MiB. The previous all-layer estimate was 16 MiB.
+        assert monitor.estimate_block_memory(64) == 4 * 1024**2
+
+    def test_estimate_block_memory_preserves_zero_kv_cache_layers(self):
+        """Rotating-only models do not fall back to all transformer layers."""
+        monitor = MemoryMonitor(max_kv_cache_memory=1024**3)
+        monitor.set_model_info(
+            num_layers=40,
+            num_kv_heads=2,
+            head_dim=128,
+            dtype_size=2,
+            num_kv_cache_layers=0,
+        )
+
+        assert monitor.estimate_block_memory(64) == 0
+
     def test_estimate_block_memory_default_values(self):
         """Test block memory estimation with default values."""
         monitor = MemoryMonitor(max_kv_cache_memory=1024**3)
@@ -669,15 +697,13 @@ class TestEstimateResidentKvBytes:
         m.set_fixed_state_bytes(999)
         assert m.estimate_resident_kv_bytes(0) == 0
 
-    def test_prompt_kv_and_block_memory_bytes_unchanged(self):
-        """Regression pin: the throttle static term and the paged-SSD
-        writer-cap input must not move with the resident-KV extension."""
+    def test_prompt_kv_and_block_memory_use_full_kv_layers_only(self):
+        """Both per-token estimates exclude fixed-state layer classes."""
         m = self._make(num_kv_cache_layers=5, rotating_layer_specs=[(25, 1024)])
         per_layer_token = 8 * 128 * 2 * 2
-        # estimate_prompt_kv_bytes: full (num_kv_cache_layers) only.
+        # Both estimates charge only the five full-attention KV layers.
         assert m.estimate_prompt_kv_bytes(1000) == 1000 * 5 * per_layer_token
-        # estimate_block_memory: all num_layers, ignores layer classes.
-        assert m.estimate_block_memory(1) == 30 * 8 * 128 * 2 * 2
+        assert m.estimate_block_memory(1) == 5 * 8 * 128 * 2 * 2
 
 
 class TestSetModelInfoFromModelRotating:
@@ -743,25 +769,167 @@ class TestDeepSeekV4PrefillMemoryProfile:
             compress_ratios=[0, 0] + [4, 128] * 20 + [4],
         )
 
-    def _monitor(self):
+    def _monitor(
+        self,
+        *,
+        ratios=None,
+        wsdpa_dtype_supported: bool = False,
+    ):
         from omlx.memory_monitor import make_prefill_memory_profile
 
         config = self._config()
-        profile = make_prefill_memory_profile(config, compute_dtype_size=2)
+        if ratios is not None:
+            config.compress_ratios = list(ratios)
+            config.num_hidden_layers = len(config.compress_ratios)
+        profile = make_prefill_memory_profile(
+            config,
+            compute_dtype_size=2,
+            wsdpa_dtype_supported=wsdpa_dtype_supported,
+        )
         assert profile is not None
         monitor = MemoryMonitor(max_kv_cache_memory=256 * 1024**3)
         monitor.set_model_info(
-            num_layers=43,
+            num_layers=config.num_hidden_layers,
             num_kv_heads=1,
             head_dim=512,
             dtype_size=2,
             num_attention_heads=64,
             num_kv_cache_layers=0,
             compute_dtype_size=2,
-            rotating_layer_specs=[(43, 128)],
+            rotating_layer_specs=[(config.num_hidden_layers, 128)],
             prefill_memory_profile=profile,
         )
         return monitor
+
+    @staticmethod
+    def _set_wsdpa_route(
+        monkeypatch,
+        *,
+        enabled: bool = True,
+        broken: bool = False,
+        dense: bool = True,
+        topk: bool = True,
+    ):
+        from omlx.patches.deepseek_v4 import wsdpa_attention as wsdpa
+
+        monkeypatch.setattr(wsdpa, "_ENABLED", enabled)
+        monkeypatch.setattr(wsdpa, "_TOPK_ENABLED", True)
+        monkeypatch.setattr(wsdpa, "_broken", broken)
+        monkeypatch.setattr(wsdpa, "_ready", dense)
+        monkeypatch.setattr(wsdpa, "_topk_ready", topk)
+
+    @staticmethod
+    def _wsdpa_bytes(query_tokens, local_tokens, pooled_tokens=0, selected=0):
+        return (
+            64 * query_tokens * 512 * (2 + 4)
+            + (local_tokens + pooled_tokens) * 512 * 2
+            + query_tokens * selected * 4
+        )
+
+    @staticmethod
+    def _native_indexer_bytes(query_tokens, pooled_tokens):
+        return (
+            64 * query_tokens * 128 * 2
+            + 64 * query_tokens * 2
+            + query_tokens * pooled_tokens * 2
+            + query_tokens * 512 * 4
+        )
+
+    def test_wsdpa_route_uses_bounded_local_transient_and_safe_fallbacks(
+        self, monkeypatch
+    ):
+        from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes
+
+        query_tokens, kv_len = 2048, 66_000
+        local_tokens = 128 + query_tokens - 1
+        fallback = estimate_unfused_sdpa_call_bytes(
+            64, query_tokens, local_tokens, 512, 2
+        )
+        supported = self._monitor(ratios=[0], wsdpa_dtype_supported=True)
+
+        self._set_wsdpa_route(monkeypatch)
+        active = supported.estimate_chunk_transient_bytes(query_tokens, kv_len)
+        assert active == self._wsdpa_bytes(query_tokens, local_tokens)
+        assert active < fallback
+
+        for enabled, broken in ((False, False), (True, True)):
+            self._set_wsdpa_route(monkeypatch, enabled=enabled, broken=broken)
+            assert (
+                supported.estimate_chunk_transient_bytes(query_tokens, kv_len)
+                == fallback
+            )
+
+        self._set_wsdpa_route(monkeypatch)
+        unsupported = self._monitor(ratios=[0], wsdpa_dtype_supported=False)
+        assert (
+            unsupported.estimate_chunk_transient_bytes(query_tokens, kv_len) == fallback
+        )
+
+    def test_active_wsdpa_route_prices_ratio128_without_scores(self, monkeypatch):
+        from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes
+
+        self._set_wsdpa_route(monkeypatch)
+        monitor = self._monitor(ratios=[128], wsdpa_dtype_supported=True)
+        query_tokens, kv_len = 2048, 66_000
+        local_tokens = 128 + query_tokens - 1
+        pooled_tokens = kv_len // 128
+        projection = 2 * query_tokens * 512 * 2
+        active = monitor.estimate_chunk_transient_bytes(query_tokens, kv_len)
+
+        assert active == projection + self._wsdpa_bytes(
+            query_tokens, local_tokens, pooled_tokens
+        )
+        concat = (local_tokens + pooled_tokens) * 512 * 2
+        fallback = estimate_unfused_sdpa_call_bytes(
+            64, query_tokens, local_tokens + pooled_tokens, 512, 2
+        )
+        assert active < projection + concat + fallback
+
+    def test_active_wsdpa_route_prices_ratio4_dense_without_scores(self, monkeypatch):
+        import omlx.memory_monitor as memory_monitor
+
+        monkeypatch.setattr(memory_monitor, "native_indexer_eligible", lambda **_: True)
+        self._set_wsdpa_route(monkeypatch)
+        monitor = self._monitor(ratios=[4], wsdpa_dtype_supported=True)
+        query_tokens = kv_len = 2048
+        pooled_tokens = kv_len // 4
+        active = monitor.estimate_chunk_transient_bytes(query_tokens, kv_len)
+
+        assert active == (
+            4 * query_tokens * (512 + 128) * 2
+            + self._native_indexer_bytes(query_tokens, pooled_tokens)
+            + self._wsdpa_bytes(query_tokens, kv_len, pooled_tokens)
+        )
+
+    def test_ratio4_topk_route_switches_between_wsdpa_and_sparse_fallback(
+        self, monkeypatch
+    ):
+        import omlx.memory_monitor as memory_monitor
+
+        monkeypatch.setattr(memory_monitor, "native_indexer_eligible", lambda **_: True)
+        monitor = self._monitor(ratios=[4], wsdpa_dtype_supported=True)
+        query_tokens, kv_len = 2048, 66_000
+        local_tokens = 128 + query_tokens - 1
+        pooled_tokens = kv_len // 4
+        selected = 512
+        common = 4 * query_tokens * (512 + 128) * 2 + self._native_indexer_bytes(
+            query_tokens, pooled_tokens
+        )
+
+        self._set_wsdpa_route(monkeypatch)
+        active = monitor.estimate_chunk_transient_bytes(query_tokens, kv_len)
+        assert active == common + self._wsdpa_bytes(
+            query_tokens, local_tokens, pooled_tokens, selected
+        )
+
+        self._set_wsdpa_route(monkeypatch, topk=False)
+        fallback = monitor.estimate_chunk_transient_bytes(query_tokens, kv_len)
+        sparse_attention = (
+            query_tokens * selected * 512 * 2
+            + 2 * 64 * query_tokens * (local_tokens + selected) * 2
+            + 64 * query_tokens * 512 * (2 + 4)
+        )
+        assert fallback == common + sparse_attention
 
     def test_resident_bytes_follow_local_and_pooled_cache_shapes(self):
         monitor = self._monitor()
@@ -779,9 +947,17 @@ class TestDeepSeekV4PrefillMemoryProfile:
         )
         assert expected < 2 * 1024**3
 
-    def test_prefill_transient_does_not_charge_dense_full_context_sdpa(self):
+    def test_native_prefill_transient_does_not_charge_dense_full_context_sdpa(
+        self, monkeypatch
+    ):
+        import omlx.memory_monitor as memory_monitor
         from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes
 
+        monkeypatch.setattr(
+            memory_monitor,
+            "native_indexer_eligible",
+            lambda **kwargs: True,
+        )
         monitor = self._monitor()
         profiled = monitor.estimate_chunk_transient_bytes(2048, 199_999)
         dense = estimate_unfused_sdpa_call_bytes(64, 2048, 199_999, 512, 2)
@@ -789,9 +965,127 @@ class TestDeepSeekV4PrefillMemoryProfile:
         assert 0 < profiled < 20 * 1024**3
         assert profiled < dense / 4
 
+    def test_prefill_transient_uses_native_indexer_for_unaligned_tail(
+        self, monkeypatch
+    ):
+        import omlx.memory_monitor as memory_monitor
+
+        monitor = self._monitor()
+        profile = monitor._prefill_memory_profile
+        assert profile is not None
+        query_tokens = 1817
+        kv_len = 347_929
+        pooled_tokens = kv_len // 4
+
+        monkeypatch.setattr(
+            memory_monitor,
+            "native_indexer_eligible",
+            lambda **kwargs: True,
+        )
+        native = monitor.estimate_chunk_transient_bytes(query_tokens, kv_len)
+
+        monkeypatch.setattr(
+            memory_monitor,
+            "native_indexer_eligible",
+            lambda **kwargs: False,
+        )
+        fallback = monitor.estimate_chunk_transient_bytes(query_tokens, kv_len)
+
+        native_indexer = profile._indexer_native_bytes(query_tokens, pooled_tokens)
+        fallback_indexer = profile._indexer_fallback_bytes(
+            query_tokens, pooled_tokens
+        )
+        assert native < fallback
+        assert native < 3 * 1024**3
+        assert fallback > 40 * 1024**3
+        assert native_indexer < 1024**3
+        assert fallback_indexer > 30 * 1024**3
+
+    def test_prefill_transient_falls_back_when_native_indexer_is_disabled(
+        self, monkeypatch
+    ):
+        import omlx.memory_monitor as memory_monitor
+
+        monitor = self._monitor()
+        calls = []
+
+        def unavailable(**kwargs):
+            calls.append(kwargs)
+            return False
+
+        monkeypatch.setattr(memory_monitor, "native_indexer_eligible", unavailable)
+        estimate = monitor.estimate_chunk_transient_bytes(1817, 347_929)
+
+        assert estimate > 0
+        assert calls == [
+            {
+                "query_tokens": 1817,
+                "pooled_tokens": 347_929 // 4,
+                "n_heads": 64,
+                "head_dim": 128,
+                "index_topk": 512,
+                "dtype_supported": True,
+            }
+        ]
+
     def test_non_v4_config_keeps_generic_estimator(self):
         from omlx.memory_monitor import make_prefill_memory_profile
 
         config = self._config()
         config.model_type = "llama"
         assert make_prefill_memory_profile(config, compute_dtype_size=2) is None
+
+
+class TestAnePrefillTransientReserve:
+    def test_ane_prefill_transient_is_added_to_the_peak(self):
+        # issue #2841: the ANE I/O surfaces are dirtied by the first long
+        # prompt, so admission reserves them on top of the KV+SDPA peak.
+        from omlx.memory_monitor import MemoryMonitor
+
+        def make(reserve=0):
+            monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+            monitor.set_model_info(
+                num_layers=62,
+                num_kv_heads=4,
+                head_dim=128,
+                dtype_size=2,
+                num_attention_heads=32,
+                ane_prefill_transient_bytes=reserve,
+            )
+            return monitor
+
+        reserve = 4 * 1024**3
+        base_peak = make().estimate_prefill_peak_bytes(32768, 2048)
+        ane_peak = make(reserve).estimate_prefill_peak_bytes(32768, 2048)
+        assert ane_peak == base_peak + reserve
+
+    def test_reserve_defaults_to_zero_and_resets_per_model(self):
+        from omlx.memory_monitor import MemoryMonitor
+
+        monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+        assert monitor._ane_prefill_transient_bytes == 0
+        monitor.set_model_info(
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=64,
+            dtype_size=2,
+            ane_prefill_transient_bytes=123,
+        )
+        assert monitor._ane_prefill_transient_bytes == 123
+        # a following model without ANE must not inherit the reserve
+        monitor.set_model_info(num_layers=2, num_kv_heads=2, head_dim=64, dtype_size=2)
+        assert monitor._ane_prefill_transient_bytes == 0
+
+    def test_clear_drops_the_reservation_after_a_shed(self):
+        from omlx.memory_monitor import MemoryMonitor
+
+        monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+        monitor.set_model_info(
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=64,
+            dtype_size=2,
+            ane_prefill_transient_bytes=123,
+        )
+        monitor.clear_ane_prefill_transient()
+        assert monitor._ane_prefill_transient_bytes == 0

@@ -33,6 +33,8 @@ final class ThroughputBenchScreenVM {
     // Form state — defaults mirror the HTML admin panel's pre-ticked options.
     var selectedModelId: String = ""
     var contextProfile: BenchmarkContextProfile = .codePython
+    var warmupMode: BenchmarkWarmupMode = .quick
+    var alignPromptToAne: Bool = false
     var promptLengths: Set<Int> = [4096, 16384]
     var genLength: String = "128"
     var batchSizes: Set<Int> = [2, 4]
@@ -223,6 +225,8 @@ final class ThroughputBenchScreenVM {
         let body = BenchStartRequest(
             modelId: selectedModelId,
             contextProfile: contextProfile,
+            warmupMode: warmupMode,
+            alignPromptToAne: alignPromptToAne,
             promptLengths: promptLengths.sorted(),
             generationLength: Int(genLength) ?? 128,
             batchSizes: batchSizes.sorted()

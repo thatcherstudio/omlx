@@ -91,9 +91,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Bring the main AppView window forward. If SwiftUI hasn't materialised
-    /// the NSWindow yet (i.e. nobody opened it since launch), kick the
-    /// `omlxapp://main` URL — the Window scene in oMLXApp.swift handles it
-    /// via `.handlesExternalEvents(matching: ["main"])`.
+    /// the NSWindow yet (i.e. nobody opened it since launch), send the
+    /// `omlxapp://main` URL back to this exact app bundle. The Window scene
+    /// in oMLXApp.swift handles the targeted external event.
     func presentAppView() {
         // Flip to .regular eagerly so the Dock icon shows in lockstep with
         // the window appearing. The `didBecomeMain` observer is a backup
@@ -114,7 +114,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         if let url = URL(string: "omlxapp://main") {
-            NSWorkspace.shared.open(url)
+            // Target this bundle explicitly. A source build and an installed
+            // release share the app.omlx identifier and omlxapp URL scheme;
+            // resolving the URL globally can launch the other copy and leave
+            // two oMLX processes in the Dock.
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            configuration.createsNewApplicationInstance = false
+            NSWorkspace.shared.open(
+                [url],
+                withApplicationAt: Bundle.main.bundleURL,
+                configuration: configuration
+            ) { _, error in
+                if let error {
+                    NSLog("oMLX: failed to open main window: \(error)")
+                }
+            }
         }
     }
 

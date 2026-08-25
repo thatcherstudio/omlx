@@ -231,6 +231,60 @@ class TestProfileRoutes:
         assert r.status_code == 200
         assert r.json()["settings"]["active_profile_name"] == "coding"
 
+    def test_apply_profile_resolves_vlm_mtp_processor_conflict(self, client):
+        c, mgr = client
+        mgr.set_settings(
+            "model-a",
+            ModelSettings(
+                vlm_mtp_enabled=True,
+                vlm_mtp_draft_model="qwen-mtp-drafter",
+            ),
+        )
+        c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "penalty",
+                "display_name": "Penalty",
+                "settings": {"presence_penalty": 1.5},
+            },
+        )
+
+        r = c.post("/admin/api/models/model-a/profiles/penalty/apply")
+
+        assert r.status_code == 200, r.text
+        settings = r.json()["settings"]
+        assert settings["presence_penalty"] == 1.5
+        assert settings["vlm_mtp_enabled"] is False
+        assert settings["active_profile_name"] == "penalty"
+        assert mgr.get_settings("model-a").vlm_mtp_enabled is False
+
+    def test_apply_profile_validation_error_is_400_without_partial_write(self, client):
+        c, mgr = client
+        mgr.set_settings(
+            "model-a",
+            ModelSettings(
+                vlm_mtp_enabled=True,
+                vlm_mtp_draft_model="qwen-mtp-drafter",
+            ),
+        )
+        c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "dflash",
+                "display_name": "DFlash",
+                "settings": {"dflash_enabled": True},
+            },
+        )
+
+        r = c.post("/admin/api/models/model-a/profiles/dflash/apply")
+
+        assert r.status_code == 400
+        assert "vlm_mtp_enabled and dflash_enabled" in r.json()["detail"]
+        persisted = mgr.get_settings("model-a")
+        assert persisted.vlm_mtp_enabled is True
+        assert persisted.dflash_enabled is False
+        assert persisted.active_profile_name is None
+
     def test_apply_profile_sanitizes_diffusion_unsupported_settings(self, client):
         c, mgr = client
         pool = admin_routes._get_engine_pool()
@@ -646,6 +700,49 @@ class TestActiveProfileDriftClearing:
         r = c.put("/admin/api/models/model-a/settings", json={"temperature": 0.5})
         assert r.status_code == 200
         assert r.json()["settings"].get("active_profile_name") is None
+
+
+class TestDefaultModelPointer:
+    """``server_state.default_model`` must track is_default in both directions.
+
+    Unlike is_pinned (which always writes straight through to the engine pool
+    entry), is_default also maintains a second, redundant "current default"
+    pointer on server_state for fast lookup. Setting is_default=True updates
+    it; unsetting is_default=False must clear it too, but only when THIS
+    model is the one currently pointed at -- unsetting a model that was never
+    the pointer target must leave someone else's default alone.
+    """
+
+    def test_setting_default_updates_the_pointer(self, client):
+        c, _ = client
+        r = c.put("/admin/api/models/model-a/settings", json={"is_default": True})
+        assert r.status_code == 200, r.text
+        assert admin_routes._get_server_state().default_model == "model-a"
+        assert r.json()["settings"]["is_default"] is True
+
+    def test_unsetting_the_current_default_clears_the_pointer(self, client):
+        c, _ = client
+        c.put("/admin/api/models/model-a/settings", json={"is_default": True})
+        assert admin_routes._get_server_state().default_model == "model-a"
+
+        r = c.put("/admin/api/models/model-a/settings", json={"is_default": False})
+        assert r.status_code == 200, r.text
+        assert admin_routes._get_server_state().default_model is None
+        assert r.json()["settings"]["is_default"] is False
+
+    def test_unsetting_a_model_that_is_not_the_pointer_leaves_it_alone(self, client):
+        c, _ = client
+        pool = admin_routes._get_engine_pool()
+        pool._entries["model-b"] = _FakeEntry("model-b")
+
+        c.put("/admin/api/models/model-a/settings", json={"is_default": True})
+        assert admin_routes._get_server_state().default_model == "model-a"
+
+        # model-b was never the pointer target; unsetting its (already-false)
+        # is_default must not disturb model-a's default status.
+        r = c.put("/admin/api/models/model-b/settings", json={"is_default": False})
+        assert r.status_code == 200, r.text
+        assert admin_routes._get_server_state().default_model == "model-a"
 
 
 class TestExposeAsModelAPI:

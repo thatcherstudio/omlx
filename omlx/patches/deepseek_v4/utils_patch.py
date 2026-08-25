@@ -136,6 +136,16 @@ def _build_patched_load_model() -> Callable:
         if model_config is not None:
             config.update(model_config)
 
+        if (
+            (model_file := config.get("model_file")) is not None
+            and not trust_remote_code
+        ):
+            raise ValueError(
+                f"The model at {model_path} requires executing custom model "
+                f"code ({model_file!r}). Pass trust_remote_code=True if you "
+                "trust this model."
+            )
+
         weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
         if not weight_files and strict:
@@ -145,13 +155,7 @@ def _build_patched_load_model() -> Callable:
         for wf in weight_files:
             weights.update(_load_safetensors(wf))  # PR 1192 change
 
-        if (model_file := config.get("model_file")) is not None:
-            if not trust_remote_code:
-                raise ValueError(
-                    f"The model at {model_path} requires executing custom model "
-                    f"code ({model_file!r}). Pass trust_remote_code=True if you "
-                    "trust this model."
-                )
+        if model_file is not None:
             spec = importlib.util.spec_from_file_location(
                 "custom_model",
                 model_path / model_file,

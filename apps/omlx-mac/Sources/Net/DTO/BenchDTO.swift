@@ -40,6 +40,11 @@ enum BenchmarkContextProfile: String, Codable, CaseIterable, Sendable {
     case novelJapanese = "novel_ja"
 }
 
+enum BenchmarkWarmupMode: String, Codable, CaseIterable, Sendable {
+    case quick
+    case ane2048 = "ane_2048"
+}
+
 /// Body for `POST /admin/api/bench/start`. `prompt_lengths` and
 /// `batch_sizes` are server-validated against a known whitelist
 /// (1024…200000 / 2…8). `generation_length` is free-form int.
@@ -51,6 +56,8 @@ enum BenchmarkContextProfile: String, Codable, CaseIterable, Sendable {
 struct BenchStartRequest: Encodable, Sendable {
     let modelId: String
     let contextProfile: BenchmarkContextProfile
+    let warmupMode: BenchmarkWarmupMode
+    let alignPromptToAne: Bool
     let promptLengths: [Int]
     let generationLength: Int
     let batchSizes: [Int]
@@ -213,6 +220,90 @@ struct BenchCancelResponse: Codable, Sendable {
 }
 
 // =============================================================================
+// MARK: - Qwen ANE/GPU split tuner
+// =============================================================================
+
+struct ANETuningStartRequest: Encodable, Sendable {
+    let modelId: String
+    let sequenceLength: Int
+    let repeats: Int
+    let allowCpu: Bool
+    let allowCpuGate: Bool
+    let allowCpuDown: Bool
+    let allowAneGdn: Bool
+    let allowCpuGdn: Bool
+    let allowCpuSharedResource: Bool
+}
+
+struct ANETuningStartResponse: Codable, Sendable {
+    let tuningId: String
+    let status: String
+    let total: Int
+}
+
+struct ANETuningCandidateDTO: Codable, Equatable, Identifiable, Sendable {
+    let label: String
+    let detail: String?
+    let stage: String?
+    let enabled: Bool
+    let mlpFraction: Double?
+    let gdnEnabled: Bool
+    let gdnFraction: Double?
+    let cpuEnabled: Bool?
+    let cpuFraction: Double?
+    let cpuDownFraction: Double?
+    let cpuGdnFraction: Double?
+    let fusedDown: Bool?
+    let state: String?
+    let processingTps: Double?
+    let latencyMs: Double?
+    let samples: [Double]
+    let speedupPercent: Double?
+    let error: String?
+
+    var id: String { label }
+}
+
+struct ANETuningRecommendationDTO: Codable, Equatable, Sendable {
+    let enabled: Bool
+    let mlpFraction: Double?
+    let gdnEnabled: Bool
+    let gdnFraction: Double?
+    let cpuEnabled: Bool?
+    let cpuFraction: Double?
+    let cpuDownFraction: Double?
+    let cpuGdnFraction: Double?
+    let fusedDown: Bool?
+    let cpuThreads: Int?
+    let cpuSharedResource: Bool?
+    // Null when the tuner returned a verdict without measuring, e.g. the
+    // GPU-only preflight on machines without the ANE compiler (#3067).
+    let processingTps: Double?
+    let speedupPercent: Double?
+    let sequenceLength: Int
+    let tailPaddingMinTokens: Int?
+}
+
+struct ANETuningStatusResponse: Codable, Sendable {
+    let tuningId: String
+    let modelId: String
+    let status: String
+    let phase: String
+    let message: String
+    let current: Int
+    let total: Int
+    let results: [ANETuningCandidateDTO]
+    let recommendation: ANETuningRecommendationDTO?
+    let error: String?
+    let terminationReason: String?
+}
+
+struct ANETuningCancelResponse: Codable, Sendable {
+    let status: String
+    let tuningId: String
+}
+
+// =============================================================================
 // MARK: - Accuracy bench
 // =============================================================================
 
@@ -272,6 +363,27 @@ struct AccuracyProgressDTO: Codable, Equatable, Sendable {
     let benchmark: String?
 }
 
+/// Community upload outcome for one accuracy suite, attached to its result
+/// by the server after the suite completes (local runs only). Same JSON `id`
+/// → `submissionId` rename rationale as BenchUploadResultDTO above.
+struct AccuracyUploadDTO: Codable, Equatable, Sendable {
+    let submissionId: String?
+    let url: String?
+    let duplicate: Bool?
+    let error: String?
+    /// Non-nil when the server chose not to upload, e.g. "min_questions"
+    /// for runs under the 100-question leaderboard minimum.
+    let skipped: String?
+
+    enum CodingKeys: String, CodingKey {
+        case submissionId = "id"
+        case url
+        case duplicate
+        case error
+        case skipped
+    }
+}
+
 struct AccuracyResultDTO: Codable, Equatable, Sendable, Identifiable {
     let benchmark: String
     let modelId: String
@@ -281,6 +393,9 @@ struct AccuracyResultDTO: Codable, Equatable, Sendable, Identifiable {
     let timeS: Double
     let thinkingUsed: Bool
     let categoryScores: [String: Double]?
+    /// Optional so results from servers predating the community upload
+    /// (and external-endpoint runs, which never upload) still decode.
+    let upload: AccuracyUploadDTO?
 
     /// Synthetic ID — the server doesn't emit one and `(benchmark,
     /// model)` is unique within an accAllResults array.

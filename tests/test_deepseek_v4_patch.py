@@ -6,6 +6,7 @@ import inspect
 import json
 import sys
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -696,6 +697,61 @@ class TestChatTemplateV4:
             is None
         )
 
+    def test_relocates_tool_adjacent_system_in_place(self, applied_patch):
+        # Claude Code's periodic reminders arrive after the Anthropic
+        # adapter split tool_result blocks, i.e. tool -> system -> assistant.
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        tool_call = {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": {"query": "x"}},
+        }
+        messages = [
+            {"role": "system", "content": "Be helpful."},
+            {"role": "user", "content": "Look it up"},
+            {"role": "assistant", "content": "", "tool_calls": [tool_call]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+            {"role": "system", "content": "Task reminder"},
+            {"role": "assistant", "content": "Done"},
+        ]
+
+        relocated = ct.relocate_mid_system_messages(messages)
+
+        assert relocated is not None
+        assert relocated[3] == {
+            "role": "latest_reminder",
+            "content": "Task reminder",
+        }
+        assert relocated[4]["role"] == "tool"
+        assert relocated[5]["role"] == "assistant"
+
+        prompt = ct.apply_chat_template(relocated, add_generation_prompt=True)
+        assert (
+            "<｜latest_reminder｜>Task reminder"
+            "<｜User｜><tool_result>result</tool_result>" in prompt
+        )
+
+    def test_relocates_tool_adjacent_system_at_tail(self, applied_patch):
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        relocated = ct.relocate_mid_system_messages(
+            [
+                {"role": "user", "content": "Look it up"},
+                {"role": "assistant", "content": "", "tool_calls": []},
+                {"role": "tool", "tool_call_id": "c1", "content": "one"},
+                {"role": "tool", "tool_call_id": "c2", "content": "two"},
+                {"role": "system", "content": "Task reminder"},
+            ]
+        )
+
+        assert relocated is not None
+        assert relocated[2] == {
+            "role": "latest_reminder",
+            "content": "Task reminder",
+        }
+        assert [m["role"] for m in relocated[3:]] == ["tool", "tool"]
+
     def test_encode_arguments_accepts_dict(self, applied_patch):
         """Anthropic /v1/messages history stores tool_call arguments as
         a dict (anthropic_utils.py decodes the input before saving).
@@ -762,6 +818,118 @@ class TestChatTemplateV4:
         assert 'invoke name="get_weather"' in prompt
         assert "Seoul" in prompt
         assert "sunny, 22C" in prompt
+
+    def test_streamed_tool_call_turn_rerender_is_byte_stable(self, applied_patch):
+        """Parser-to-rerender round trip: content accumulated from the
+        streaming filter's deltas, re-rendered through the template, must
+        reproduce the model's raw emission byte-for-byte.
+
+        The reference decoder consumes "\\n\\n<｜DSML｜tool_calls" as one
+        literal stop token, so the separator before a tool-call block
+        belongs to the envelope, not to content. The streaming filter now
+        mirrors that: a client that accumulates content deltas stores the
+        turn without the separator, and the template's own canonical
+        "\\n\\n" restores it on re-render -- prompts stay append-only
+        across tool hops.
+        """
+        from omlx.api.tool_calling import ToolCallStreamFilter
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+        from omlx.patches.deepseek_v4 import tool_parser_v4 as tp
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "description": "Run a shell command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                },
+            }
+        ]
+        turn_0_user = {"role": "user", "content": "List the files in /tmp for me."}
+
+        # The exact prompt the model was fed to GENERATE the tool-call turn.
+        prompt_for_turn = ct.apply_chat_template(
+            [turn_0_user],
+            tools=tools,
+            thinking_mode="chat",
+            add_generation_prompt=True,
+        )
+
+        # The model's raw, unparsed emission: prose, the trained "\n\n"
+        # separator, then the DSML block built from the template's own
+        # grammar pieces.
+        tc_args = {"command": "ls -la /tmp"}
+        raw_dsml_block = ct.tool_calls_template.format(
+            dsml_token=ct.dsml_token,
+            tool_calls=ct.tool_call_template.format(
+                dsml_token=ct.dsml_token,
+                name="bash",
+                arguments=ct.encode_arguments_to_dsml(
+                    {"name": "bash", "arguments": tc_args}
+                ),
+            ),
+            tc_block_name=ct.tool_calls_block_name,
+        )
+        raw_emission = "I'll list the files in /tmp for you.\n\n" + raw_dsml_block
+
+        # Accumulate content exactly as a streaming client does: feed the
+        # raw emission character-by-character so every boundary -- inside
+        # the separator, inside the DSML markers -- is split across feeds.
+        stream_filter = ToolCallStreamFilter(
+            SimpleNamespace(
+                tool_call_start=tp.tool_call_start, tool_call_end=tp.tool_call_end
+            )
+        )
+        accumulated_content = ""
+        for ch in raw_emission:
+            accumulated_content += stream_filter.feed(ch)
+        accumulated_content += stream_filter.finish()
+        assert accumulated_content == "I'll list the files in /tmp for you."
+
+        turn_0_assistant = {
+            "role": "assistant",
+            "content": accumulated_content,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": tc_args},
+                }
+            ],
+        }
+
+        # The decode loop stops before the eos token, so a completed
+        # turn's full text adds it back once.
+        prev_full_text = prompt_for_turn + raw_emission + ct.eos_token
+
+        # Byte-stability: re-rendering the completed turn from its
+        # parser-derived structured form reproduces the raw emission.
+        render_through_turn = ct.apply_chat_template(
+            [turn_0_user, turn_0_assistant], tools=tools, thinking_mode="chat"
+        )
+        assert render_through_turn == prev_full_text
+        assert "\n\n\n" not in render_through_turn
+
+        # Append-only: the NEXT turn (tool result + new user message)
+        # extends that exact text rather than re-deriving a different
+        # rendering of the historical tool-call turn.
+        turn_1_tool_result = {
+            "role": "tool",
+            "content": "foo.log (123 bytes)\nbar.txt (4096 bytes)",
+        }
+        turn_1_user = {"role": "user", "content": "Which file is bigger?"}
+        render_through_next_turn = ct.apply_chat_template(
+            [turn_0_user, turn_0_assistant, turn_1_tool_result, turn_1_user],
+            tools=tools,
+            thinking_mode="chat",
+            add_generation_prompt=True,
+        )
+        assert render_through_next_turn.startswith(prev_full_text)
 
 
 class TestChatTemplateModuleRegistration:
@@ -850,6 +1018,26 @@ class TestPatchedLoadModelTrustRemoteCode:
             trust_remote_code=True,
         )
         assert (tmp_path / "executed.txt").read_text() == "yes"
+
+    def test_untrusted_model_file_is_rejected_before_safetensors_open(
+        self, tmp_path, applied_patch, monkeypatch
+    ):
+        (tmp_path / "config.json").write_text(
+            '{"model_type": "custom", "model_file": "custom_arch.py"}'
+        )
+        (tmp_path / "model.safetensors").write_bytes(b"not opened")
+
+        from mlx_lm import utils
+
+        from omlx.patches.deepseek_v4 import utils_patch
+
+        load_weights = MagicMock(side_effect=AssertionError("weights were opened"))
+        monkeypatch.setattr(utils_patch, "_load_safetensors", load_weights)
+
+        with pytest.raises(ValueError, match="trust_remote_code=True"):
+            utils.load_model(tmp_path, lazy=True)
+
+        load_weights.assert_not_called()
 
 
 class TestCacheHandlerRegistration:
@@ -1251,6 +1439,43 @@ class TestDeepseekV4CompressedNativeAttention:
         )
 
         assert result is None
+
+    def test_topk_wsdpa_dispatch_ignores_native_sparse_disable(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        expected = mx.zeros((1, 64, 5, 512), dtype=mx.bfloat16)
+        calls = []
+
+        def wsdpa_spy(*args):
+            calls.append(args)
+            return expected
+
+        monkeypatch.setattr(dsv4, "wsdpa_topk_prefill", wsdpa_spy)
+        monkeypatch.setattr(
+            dsv4,
+            "_DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED",
+            True,
+        )
+        actual = dsv4._sparse_pooled_attention(
+            mx.zeros((1, 64, 5, 512), dtype=mx.bfloat16),
+            mx.zeros((1, 1, 133, 512), dtype=mx.bfloat16),
+            mx.zeros((1, 513, 512), dtype=mx.bfloat16),
+            mx.zeros((1, 5, 512), dtype=mx.uint32),
+            None,
+            None,
+            512**-0.5,
+            mx.zeros((64,), dtype=mx.bfloat16),
+            q_offset=128,
+            compress_ratio=4,
+            local_window=128,
+            _standard_mask=True,
+        )
+
+        assert actual is expected
+        assert len(calls) == 1
 
     @pytest.mark.parametrize(
         ("dtype_name", "max_tolerance"),
@@ -1994,8 +2219,6 @@ class TestIndexerFallbackTiling:
 
         import mlx.core as mx
 
-        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
-
         dm = sys.modules["mlx_lm.models.deepseek_v4"]
         config = dm.ModelArgs(
             hidden_size=16,
@@ -2005,22 +2228,22 @@ class TestIndexerFallbackTiling:
             compress_ratios=[4],
             index_n_heads=32,
             index_head_dim=128,
-            index_topk=8,
+            index_topk=512,
         )
         indexer = dm.Indexer(config, compress_ratio=4)
-        pooled = mx.zeros((1, 64, 128), dtype=mx.float16)
+        pooled = mx.zeros((1, 577, 128), dtype=mx.float16)
         monkeypatch.setattr(
             dm.Compressor,
             "__call__",
             lambda self, x, pool_cache, offset: pooled,
         )
-        monkeypatch.setattr(glm_fast, "has_symbol", lambda name: False)
-        monkeypatch.setattr(dm, "_DEEPSEEK_V4_INDEXER_NATIVE_DISABLED", False)
+        monkeypatch.setattr(dm, "native_indexer_available", lambda: False)
+        monkeypatch.setattr(dm, "native_indexer_disabled", lambda: False)
         monkeypatch.setattr(dm, "_DEEPSEEK_V4_INDEXER_FALLBACK_WARNED", False)
 
-        x = mx.zeros((1, 64, 16), dtype=mx.float16)
-        projected_q = mx.zeros((1, 32, 64, 128), dtype=mx.float16)
-        projected_weights = mx.zeros((1, 64, 32), dtype=mx.float16)
+        x = mx.zeros((1, 65, 16), dtype=mx.float16)
+        projected_q = mx.zeros((1, 32, 65, 128), dtype=mx.float16)
+        projected_weights = mx.zeros((1, 65, 32), dtype=mx.float16)
         with caplog.at_level(logging.WARNING, logger=dm.__name__):
             for _ in range(2):
                 result = indexer(

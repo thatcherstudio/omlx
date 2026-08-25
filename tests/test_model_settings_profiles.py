@@ -295,6 +295,35 @@ class TestApplyProfile:
         mgr.apply_profile("m", "p")
         assert mgr.get_settings("m").turboquant_kv_enabled is True
 
+    def test_apply_resolves_vlm_mtp_processor_conflict(self, tmp_path):
+        manager = ModelSettingsManager(tmp_path)
+        manager.set_settings(
+            "m",
+            ModelSettings(
+                vlm_mtp_enabled=True,
+                vlm_mtp_draft_model="qwen-mtp-drafter",
+            ),
+        )
+        manager.save_profile(
+            "m",
+            "penalty",
+            "Penalty",
+            None,
+            {"presence_penalty": 1.5},
+        )
+
+        applied = manager.apply_profile("m", "penalty")
+
+        assert applied is not None
+        assert applied.presence_penalty == 1.5
+        assert applied.vlm_mtp_enabled is False
+        assert applied.active_profile_name == "penalty"
+
+        persisted = ModelSettingsManager(tmp_path).get_settings("m")
+        assert persisted.presence_penalty == 1.5
+        assert persisted.vlm_mtp_enabled is False
+        assert persisted.active_profile_name == "penalty"
+
     def test_apply_tolerates_legacy_empty_string_values(self, tmp_path):
         profiles_file = tmp_path / "model_profiles.json"
         profiles_file.write_text(
@@ -364,6 +393,34 @@ class TestProfileFieldFiltering:
             settings={"top_p": 0.9, "max_tokens": None, "reasoning_parser": ""},
         )
         assert mgr.get_profile("m", "p")["settings"] == {"top_p": 0.9}
+
+    def test_qwen_ane_prefill_fields_round_trip_as_model_specific(self, mgr):
+        settings = {
+            "qwen35_ane_prefill_enabled": True,
+            "qwen35_ane_prefill_sequence_length": 2048,
+            "qwen35_ane_prefill_tail_padding_min_tokens": 1357,
+            "qwen35_ane_prefill_fraction": 0.53,
+            "qwen35_ane_prefill_max_layers": 64,
+            "qwen35_ane_prefill_dual_ane": True,
+            "qwen35_ane_prefill_gdn": True,
+            "qwen35_ane_prefill_gdn_fraction": 0.50,
+            "qwen35_ane_prefill_gdn_max_layers": 48,
+        }
+
+        mgr.save_profile("m", "ane", "ANE", None, settings)
+        assert mgr.get_profile("m", "ane")["settings"] == settings
+
+        mgr.apply_profile("m", "ane")
+        applied = mgr.get_settings("m")
+        assert applied.qwen35_ane_prefill_enabled is True
+        assert applied.qwen35_ane_prefill_sequence_length == 2048
+        assert applied.qwen35_ane_prefill_tail_padding_min_tokens == 1357
+        assert applied.qwen35_ane_prefill_fraction == 0.53
+        assert applied.qwen35_ane_prefill_max_layers == 64
+        assert applied.qwen35_ane_prefill_dual_ane is True
+        assert applied.qwen35_ane_prefill_gdn is True
+        assert applied.qwen35_ane_prefill_gdn_fraction == 0.50
+        assert applied.qwen35_ane_prefill_gdn_max_layers == 48
 
     def test_save_template_drops_none_and_empty_string_values(self, mgr):
         mgr.save_template(

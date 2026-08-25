@@ -60,7 +60,7 @@ Download the `.dmg` from [Releases](https://github.com/jundot/omlx/releases), dr
 
 ```bash
 brew tap jundot/omlx https://github.com/jundot/omlx
-brew install omlx
+brew install jundot/omlx/omlx
 
 # Upgrade to the latest version
 brew update && brew upgrade omlx
@@ -75,7 +75,7 @@ omlx start
 Optional GLM-5.2 / MiniMax M3 native custom kernels currently require a HEAD build:
 
 ```bash
-brew install omlx --HEAD --with-custom-kernel
+brew install jundot/omlx/omlx --HEAD --with-custom-kernel
 ```
 
 ### From Source
@@ -91,7 +91,7 @@ pip install -e ".[mcp]"   # With MCP (Model Context Protocol) support
 OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 ```
 
-Requires macOS 15.0+ (Sequoia), Python 3.11–3.13, and Apple Silicon (M1/M2/M3/M4).
+Requires macOS 15.0+ (Sequoia), Python 3.11–3.13, and Apple Silicon (M1/M2/M3/M4/M5).
 
 > **Note on native custom kernels:** a plain `pip install -e .` does NOT build
 > them, and the affected model families then silently fall back to much slower
@@ -100,7 +100,7 @@ Requires macOS 15.0+ (Sequoia), Python 3.11–3.13, and Apple Silicon (M1/M2/M3/
 > uses more memory (#2137). Building them requires the Metal toolchain, which
 > Command Line Tools alone do not provide (`xcrun: error: unable to find utility
 > "metal"`): install full Xcode, or use the official DMG which ships the kernels
-> precompiled. Homebrew can build them with `brew install omlx --HEAD
+> precompiled. Homebrew can build them with `brew install jundot/omlx/omlx --HEAD
 > --with-custom-kernel`, but that build also needs full Xcode. To verify your
 > install:
 >
@@ -165,6 +165,20 @@ Web UI at `/admin` for real-time monitoring, model management, chat, benchmark, 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.45.34.png" alt="oMLX Admin Dashboard" width="720">
 </p>
+
+### Experimental Multi-Mac Inference
+
+Source builds can split one downloaded language model across unequal-memory Macs
+using MLX pipeline ranks over Ring or Thunderbolt RDMA/JACCL. The Cluster
+dashboard handles read-only peer discovery, strict SSH/runtime verification,
+byte-aware unequal shard planning, measured compute/link rebalancing,
+headroom-aware execution tuning, activation, and a live shard/performance map
+on both Macs. Interactive, balanced, and throughput profiles expose coalesced
+batching, prompt-cache affinity, rotating-KV limits, Ring connection tuning,
+and a capability-gated experimental token-only output path. See
+[Distributed inference across Macs](docs/distributed-cluster.md) for setup,
+security boundaries, current limitations, and the physical-hardware validation
+checklist.
 
 ### Vision-Language Models
 
@@ -246,7 +260,7 @@ One-click benchmarking from the admin panel. Measures prefill (PP) and text gene
 
 ### macOS Menubar App
 
-Native Swift / SwiftUI menubar app (not Electron). Start, stop, and monitor the server without opening a terminal. Includes persistent serving stats (survives restarts), auto-restart on crash, and Sparkle-driven auto-update.
+Native Swift / SwiftUI menubar app (not Electron). Start, stop, and monitor the server without opening a terminal. Includes persistent serving stats (survives restarts), auto-restart on crash, and built-in auto-update.
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.51.54.png" alt="oMLX Menubar Stats" width="400">
@@ -421,4 +435,5 @@ Contributions are welcome! See [Contributing Guide](docs/CONTRIBUTING.md) for de
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Embedding model support for Apple Silicon
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Block diffusion speculative decoding on Apple Silicon
 - [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP's verify-shape Metal kernels are powered by MTPLX by Youssof Altoukhi, which also inspired the depth-k pipeline
+- [mlx-serve](https://github.com/ddalcu/mlx-serve) - The fused GDN verify prework kernel is adapted from mlx-serve's port of the mlxfast-challenge qwen35_packed_gdn_prework kernel
 - [SiliconScope](https://github.com/kennss/SiliconScope) - The menu bar statistics take their design and rendering approach from SiliconScope by Kennt Kim, which also inspired the energy-efficient re-render gating
