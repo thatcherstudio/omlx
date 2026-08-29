@@ -259,10 +259,12 @@ def drop_ctx(model: Any) -> None:
 
 
 def _host_eligible(host: Any) -> bool:
+    get_mtp = getattr(host, "get_mtp_module", None)
+    mtp = get_mtp() if callable(get_mtp) else getattr(host, "mtp", None)
     return bool(
         getattr(host, "_omlx_mtp_decode_enabled", False)
         and getattr(host, "_omlx_mtp_chain", False)
-        and getattr(host, "mtp", None) is not None
+        and mtp is not None
     )
 
 
@@ -360,9 +362,7 @@ def maybe_capture(
 
     if ctx.pending_hidden is not None:
         if seq_len > 1:
-            pairs_hidden = mx.concatenate(
-                [ctx.pending_hidden, normed[:, :-1]], axis=1
-            )
+            pairs_hidden = mx.concatenate([ctx.pending_hidden, normed[:, :-1]], axis=1)
         else:
             pairs_hidden = ctx.pending_hidden
         pairs_tokens = inputs

@@ -632,6 +632,47 @@ class TestQwenCpuShareMemoryEstimate:
 
         assert pool._entry_runtime_resident_size(entry, settings) == 2000
 
+    def test_qwen4_ple_offload_reduces_resident_projection(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+        from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
+            Qwen4ExpResidencyEstimate,
+        )
+
+        model = tmp_path / "qwen4"
+        model.mkdir()
+        settings = ModelSettings(qwen4_ple_ssd_offload=False)
+        entry = EngineEntry(
+            model_id="qwen4",
+            model_path=str(model),
+            model_type="vlm",
+            engine_type="vlm",
+            config_model_type="qwen4_exp",
+            estimated_size=1000,
+        )
+        estimate = Qwen4ExpResidencyEstimate(
+            supported=True,
+            checkpoint_bytes=950,
+            ple_bytes=550,
+            resident_bytes=1000,
+            mmap_bytes=400,
+        )
+        pool = _make_pool(ceiling=500)
+        pool._entries[entry.model_id] = entry
+
+        with patch(
+            "omlx.patches.mlx_vlm_qwen4_exp_compat.residency."
+            "qwen4_exp_residency_estimate",
+            return_value=estimate,
+        ):
+            projected = pool._entry_runtime_resident_size(entry, settings)
+            effective = pool._effective_qwen4_model_settings(entry, settings)
+            signature = dict(pool._engine_runtime_signature("qwen4", settings))
+
+        assert projected == 400
+        assert settings.qwen4_ple_ssd_offload is False
+        assert effective.qwen4_ple_ssd_offload is True
+        assert signature["qwen4_ple_ssd_offload"] == "True"
+
 
 class TestApplySettingsOverrides:
     """Tests for apply_settings_overrides method."""

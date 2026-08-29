@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for load-failure invalidation in admin model settings."""
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -25,6 +26,26 @@ def _failed_pool() -> tuple[EnginePool, EngineEntry]:
     )
     pool._entries[entry.model_id] = entry
     return pool, entry
+
+
+def _write_qwen4_mtp_checkpoint(tmp_path, *, embedded_mtp: bool) -> None:
+    config = {
+        "model_type": "qwen4_exp",
+        "text_config": {
+            "num_hidden_layers": 48,
+            "mtp_num_hidden_layers": 1,
+            "num_nextn_predict_layers": 1,
+        },
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    weight_key = (
+        "mtp.fc_hidden.weight"
+        if embedded_mtp
+        else "model.layers.48.self_attn.q_proj.weight"
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {weight_key: "model.safetensors"}})
+    )
 
 
 async def _update_settings(
@@ -166,6 +187,72 @@ async def test_qwen_ane_prefill_accepts_qwen38_config_type():
     )
 
     assert settings.qwen35_ane_prefill_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_qwen4_ple_ssd_offload_is_persisted_for_qwen4_only():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen4_exp"
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(qwen4_ple_ssd_offload=True),
+    )
+
+    assert settings.qwen4_ple_ssd_offload is True
+
+
+@pytest.mark.asyncio
+async def test_qwen4_ple_ssd_offload_is_ignored_for_other_models():
+    pool, _ = _failed_pool()
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(qwen4_ple_ssd_offload=True),
+    )
+
+    assert settings.qwen4_ple_ssd_offload is False
+
+
+@pytest.mark.asyncio
+async def test_qwen4_mtp_setting_accepts_embedded_head(tmp_path):
+    _write_qwen4_mtp_checkpoint(tmp_path, embedded_mtp=True)
+    pool, entry = _failed_pool()
+    entry.model_path = str(tmp_path)
+    entry.config_model_type = "qwen4_exp"
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(mtp_enabled=True),
+    )
+
+    assert settings.mtp_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_qwen4_mtp_setting_rejects_nextn_only_layout(tmp_path):
+    _write_qwen4_mtp_checkpoint(tmp_path, embedded_mtp=False)
+    pool, entry = _failed_pool()
+    entry.model_path = str(tmp_path)
+    entry.config_model_type = "qwen4_exp"
+    settings = ModelSettings()
+
+    with pytest.raises(admin_routes.HTTPException) as exc_info:
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(mtp_enabled=True),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "native nextn layers are not supported" in exc_info.value.detail
+    assert settings.mtp_enabled is False
 
 
 @pytest.mark.asyncio

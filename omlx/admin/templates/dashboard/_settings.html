@@ -970,6 +970,26 @@
                                         </div>
                                     </div>
 
+                                    <!-- Uploads subsection -->
+                                    <div class="px-6 py-3 bg-neutral-50 border-t border-neutral-200">
+                                        <div class="flex items-center gap-2">
+                                            <i data-lucide="upload" class="w-3.5 h-3.5 text-neutral-400"></i>
+                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.uploads') }}</span>
+                                        </div>
+                                    </div>
+                                    <div class="divide-y divide-neutral-100">
+                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                            <div class="flex-1">
+                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.max_audio_upload_size') }}</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.max_audio_upload_size_hint') }}</p>
+                                            </div>
+                                            <input type="text"
+                                                   x-model.trim="globalSettings.server.max_audio_upload_size"
+                                                   placeholder="100MB"
+                                                   class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
+                                        </div>
+                                    </div>
+
                                     <!-- Streaming subsection -->
                                     <div class="px-6 py-3 bg-neutral-50 border-t border-neutral-200">
                                         <div class="flex items-center gap-2">

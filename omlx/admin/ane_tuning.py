@@ -776,21 +776,27 @@ def _profile_refinement(
             float(gdn.get("ane1_eval_ns", 0.0)),
         ) / gdn_ops
         gpu_time = float(gdn.get("gpu_completion_ns", 0.0)) / gdn_ops
-        widths = [float(gdn_fraction)]
-        times = [ane_time]
-        # Below the structural floor a fraction compiles 0 GDN procedures at
-        # apply time, so the refinement must not pick one (issue #2899).
-        gdn_grid = sorted(
-            set([*_gdn_fraction_grid(), 0.35, 0.40, 0.465, 0.50, 0.53, 0.55])
+        # The production GDN path precision-caps ANE at the token-local z
+        # projection. Its structural floor is therefore also its only real
+        # ANE width; larger requested fractions compile the same z-only slice.
+        effective_gdn_fraction = (
+            float(gdn_floor) if gdn_floor is not None else float(gdn_fraction)
         )
-        if gdn_floor is not None:
-            gdn_grid = [value for value in gdn_grid if value >= gdn_floor]
+        widths = [effective_gdn_fraction]
+        times = [ane_time]
+        gdn_grid = (
+            [float(gdn_floor)]
+            if gdn_floor is not None
+            else sorted(
+                set([*_gdn_fraction_grid(), 0.35, 0.40, 0.465, 0.50, 0.53, 0.55])
+            )
+        )
         choices = [gdn_grid or [float(gdn_fraction)]]
         if cpu_gdn_fraction > 0:
             widths.append(cpu_gdn_fraction)
             times.append(float(gdn.get("cpu_completion_ns", 0.0)) / gdn_ops)
             choices.append(_cpu_gdn_fraction_grid())
-        widths.append(1.0 - float(gdn_fraction) - cpu_gdn_fraction)
+        widths.append(1.0 - effective_gdn_fraction - cpu_gdn_fraction)
         times.append(gpu_time)
         choices.append([widths[-1]])
         balanced = _balanced_fractions(widths, times, choices)
@@ -1025,7 +1031,11 @@ def _calibrate_fused_components_sync(
     calibration_threads = _CALIBRATION_CPU_THREADS
     fractions = _fused_fraction_grid()
     cpu_fractions = _fused_cpu_fraction_grid() if cpu_supported else [0.0]
-    gdn_fractions = _gdn_fraction_grid() if gdn is not None else []
+    gdn_fractions = (
+        [float(run.gdn_floor)]
+        if gdn is not None and run.gdn_floor is not None
+        else []
+    )
     gdn_cpu_fractions = _cpu_gdn_fraction_grid() if gdn_cpu_supported else [0.0]
 
     run.phase = "compiling_calibration"
@@ -1723,8 +1733,8 @@ def _calibrate_components_sync(
         if value is not None:
             state, dense0, dense1 = value
             prepared.append(("mlp", fraction, state, dense0, dense1))
-    if gdn is not None:
-        for fraction in fractions:
+    if gdn is not None and run.gdn_floor is not None:
+        for fraction in [float(run.gdn_floor)]:
             config = patch._AneGDNConfig(
                 run.request.sequence_length, fraction, 8, dual_ane
             )
@@ -1766,7 +1776,9 @@ def _calibrate_components_sync(
         fraction for fraction in fractions if ("mlp", fraction) in ane_models
     ]
     valid_gdn_fractions = [
-        fraction for fraction in fractions if ("gdn", fraction) in ane_models
+        fraction
+        for fraction in ([float(run.gdn_floor)] if run.gdn_floor is not None else [])
+        if ("gdn", fraction) in ane_models
     ]
     # The loaded private programs own their compiled weight blobs. Release the
     # much larger temporary FP32 source slices before allocating CPU variants.

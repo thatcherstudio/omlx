@@ -129,6 +129,7 @@ class ModelSettingsRequest(BaseModel):
     ttl_seconds: int | None = None
     index_cache_freq: int | None = None
     enable_thinking: bool | None = None
+    qwen4_ple_ssd_offload: bool | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # TurboQuant KV cache (mlx-vlm backend)
@@ -247,6 +248,7 @@ class GlobalSettingsRequest(BaseModel):
     burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
     preserve_mid_system_cache: bool | None = None
     distributed_inference_enabled: bool | None = None
+    max_audio_upload_size: str | None = None
 
     # Model settings
     model_dirs: list[str] | None = None
@@ -673,8 +675,9 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
     converter actually preserved the MTP tensors, using the loader's
     ``_checkpoint_has_mtp_weights`` so native nextn layouts
     (``model.layers.<num_hidden_layers + i>.*``, e.g. GLM-5.2) count as
-    present (issue #2326). Default mlx-lm converters strip ``mtp.*``;
-    PR 990 ships a separate path that keeps them.
+    present (issue #2326). Qwen4-Exp uses its narrower runtime detector,
+    which accepts only embedded ``mtp.*`` tensors. Default mlx-lm converters
+    strip ``mtp.*``; PR 990 ships a separate path that keeps them.
     """
     import json
     from pathlib import Path
@@ -702,7 +705,14 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
     model_type = cfg.get("model_type")
     if not _has_mtp_heads(cfg):
         return False, "model has no MTP heads in config"
-    if not _is_mtp_compatible(cfg, model_type):
+    # qwen4_exp (Qwen3.8 Flash Next) attaches its Lightning MTP head through
+    # the dedicated VLM path in omlx.utils.model_loading (vendored mlx-vlm
+    # qwen4_exp model + mlx_lm_mtp dispatch patch) and never goes through the
+    # mlx-lm ``_is_mtp_compatible`` whitelist, which gates the generic
+    # text-model patch. Mirroring the runtime, the admin gate accepts
+    # qwen4_exp and relies on the embedded ``mtp.*`` weight check below —
+    # the same condition the runtime path uses.
+    if model_type != "qwen4_exp" and not _is_mtp_compatible(cfg, model_type):
         return False, (
             f"model_type={model_type!r} is not on the MTP whitelist "
             "(supported: qwen3_5*, qwen3_6*, deepseek_v4*, glm_moe_dsa, "
@@ -717,6 +727,11 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
             return False, (
                 "MTPLX side-car detected but not imported. Import it to "
                 "merge the MTP head into the checkpoint index."
+            )
+        if model_type == "qwen4_exp":
+            return False, (
+                "Qwen4-Exp Lightning MTP requires embedded mtp.* tensors; "
+                "native nextn layers are not supported by its dedicated runtime."
             )
         return False, (
             "Config declares MTP layers but the weight files contain neither "
@@ -1878,6 +1893,15 @@ async def list_models(is_admin: bool = Depends(require_admin)):
     # Get engine pool status
     status = engine_pool.get_status()
     models_status = status.get("models", [])
+    residency_ceiling = int(status.get("final_ceiling", 0) or 0)
+    fallback_ceiling = getattr(engine_pool, "_fallback_admission_ceiling", None)
+    if callable(fallback_ceiling):
+        try:
+            candidate = fallback_ceiling()
+            if isinstance(candidate, (int, float)) and candidate > 0:
+                residency_ceiling = int(candidate)
+        except Exception:  # noqa: BLE001
+            pass
 
     # Get all model settings
     all_settings = settings_manager.get_all_settings() if settings_manager else {}
@@ -1912,6 +1936,33 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
         mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
+        qwen4_ple_ssd_offload_supported = False
+        qwen4_ple_ssd_offload_forced = False
+        qwen4_resident_bytes = 0
+        qwen4_mmap_bytes = 0
+        if (model_info.get("config_model_type") or "").replace(
+            "-", "_"
+        ).lower() == "qwen4_exp":
+            try:
+                from ..patches.mlx_vlm_qwen4_exp_compat.residency import (
+                    qwen4_exp_residency_estimate,
+                )
+
+                estimate = qwen4_exp_residency_estimate(
+                    model_info.get("model_path", "")
+                )
+                qwen4_ple_ssd_offload_supported = estimate.supported
+                qwen4_ple_ssd_offload_forced = estimate.force_ssd_offload(
+                    residency_ceiling
+                )
+                qwen4_resident_bytes = estimate.resident_bytes
+                qwen4_mmap_bytes = estimate.mmap_bytes
+            except (OSError, TypeError, ValueError):
+                logger.debug(
+                    "Could not inspect Qwen4-Exp PLE residency for %s",
+                    model_id,
+                    exc_info=True,
+                )
 
         model_data = {
             "id": model_id,
@@ -1962,6 +2013,10 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "dflash_ssd_cache_available": dflash_ssd_cache_available,
             "mtp_compatible": mtp_compat_ok,
             "mtp_compatibility_reason": mtp_compat_reason,
+            "qwen4_ple_ssd_offload_supported": qwen4_ple_ssd_offload_supported,
+            "qwen4_ple_ssd_offload_forced": qwen4_ple_ssd_offload_forced,
+            "qwen4_ple_resident_bytes": qwen4_resident_bytes,
+            "qwen4_ple_mmap_bytes": qwen4_mmap_bytes,
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
         }
@@ -2286,6 +2341,13 @@ async def update_model_settings(
         )
     if "enable_thinking" in sent:
         current_settings.enable_thinking = request.enable_thinking
+    if "qwen4_ple_ssd_offload" in sent:
+        is_qwen4_exp = (entry.config_model_type or "").replace(
+            "-", "_"
+        ).lower() == "qwen4_exp"
+        current_settings.qwen4_ple_ssd_offload = bool(
+            request.qwen4_ple_ssd_offload and is_qwen4_exp
+        )
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = (
             request.thinking_budget_enabled or False
@@ -2637,7 +2699,10 @@ async def update_model_settings(
                     detail=f"MTP enabled but failed to read model config: {e}",
                 )
             model_type = cfg.get("model_type")
-            if not _is_mtp_compatible(cfg, model_type):
+            # qwen4_exp routes through the dedicated VLM Lightning MTP path
+            # (see _mtp_compat_for_model); skip the mlx-lm whitelist here but
+            # keep the mtp.* weight check below.
+            if model_type != "qwen4_exp" and not _is_mtp_compatible(cfg, model_type):
                 raise HTTPException(
                     status_code=400,
                     detail=(
@@ -2649,6 +2714,15 @@ async def update_model_settings(
                     ),
                 )
             if not _checkpoint_has_mtp_weights(entry.model_path):
+                if model_type == "qwen4_exp":
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Qwen4-Exp Lightning MTP requires embedded mtp.* "
+                            "tensors; native nextn layers are not supported by "
+                            "its dedicated runtime."
+                        ),
+                    )
                 raise HTTPException(
                     status_code=400,
                     detail=(
@@ -3471,6 +3545,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
                     False,
                 )
             ),
+            "max_audio_upload_size": global_settings.server.max_audio_upload_size,
         },
         "model": {
             "model_dirs": [
@@ -3717,6 +3792,23 @@ async def update_global_settings(
         global_settings.server.distributed_inference_enabled = (
             request.distributed_inference_enabled
         )
+    if request.max_audio_upload_size is not None:
+        from ..config import parse_size
+
+        try:
+            audio_upload_size = parse_size(request.max_audio_upload_size)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid max_audio_upload_size: {exc}",
+            ) from exc
+        if audio_upload_size <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="max_audio_upload_size must be positive",
+            )
+        global_settings.server.max_audio_upload_size = request.max_audio_upload_size
+        runtime_applied.append("max_audio_upload_size")
 
     if request.server_aliases is not None:
         from ..utils.network import is_valid_alias

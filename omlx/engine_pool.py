@@ -14,6 +14,7 @@ when memory limits are exceeded. It supports:
 from __future__ import annotations
 
 import asyncio
+import copy
 import gc
 import json
 import logging
@@ -348,6 +349,11 @@ class EnginePool:
         base = self._entry_resident_size(entry) if base_size is None else base_size
         if self._distributed_deployment_for_entry(entry) is not None:
             return base
+        qwen4_offload, _, qwen4_estimate = self._qwen4_ple_offload_status(
+            entry, runtime_settings
+        )
+        if qwen4_offload and qwen4_estimate is not None:
+            base = min(base, qwen4_estimate.mmap_bytes)
         extra = _qwen35_cpu_share_estimated_bytes(entry.model_path, runtime_settings)
         if extra is None:
             # An enabled CPU path with unreadable geometry must not silently
@@ -366,6 +372,52 @@ class EnginePool:
                 entry.model_id,
             )
         return base + extra
+
+    def _qwen4_ple_offload_status(
+        self,
+        entry: EngineEntry,
+        settings: object | None,
+    ) -> tuple[bool, bool, object | None]:
+        """Resolve requested/forced Qwen4 PLE mmap mode for this process."""
+
+        model_type = (entry.config_model_type or "").replace("-", "_").lower()
+        if model_type != "qwen4_exp":
+            return False, False, None
+        try:
+            from .patches.mlx_vlm_qwen4_exp_compat.residency import (
+                qwen4_exp_residency_estimate,
+            )
+
+            estimate = qwen4_exp_residency_estimate(entry.model_path)
+        except (OSError, TypeError, ValueError):
+            logger.debug(
+                "Could not inspect Qwen4-Exp PLE residency for %s",
+                entry.model_id,
+                exc_info=True,
+            )
+            return False, False, None
+        ceiling = self._fallback_admission_ceiling()
+        if ceiling <= 0:
+            ceiling = self._current_ceiling()
+        forced = estimate.force_ssd_offload(ceiling)
+        requested = bool(
+            settings is not None and getattr(settings, "qwen4_ple_ssd_offload", False)
+        )
+        return requested or forced, forced, estimate if estimate.supported else None
+
+    def _effective_qwen4_model_settings(
+        self,
+        entry: EngineEntry,
+        settings: object | None,
+    ) -> object | None:
+        """Apply a forced mmap decision without mutating persisted settings."""
+
+        enabled, forced, _ = self._qwen4_ple_offload_status(entry, settings)
+        if not enabled or not forced or settings is None:
+            return settings
+        effective = copy.copy(settings)
+        setattr(effective, "qwen4_ple_ssd_offload", True)
+        return effective
 
     @property
     def current_model_memory(self) -> int:
@@ -534,6 +586,9 @@ class EnginePool:
         # force a reload when the corresponding feature is disabled.
         mtp_active = bool(data.get("mtp_enabled", False))
         add("mtp_enabled", mtp_active)
+        if entry is not None:
+            qwen4_offload, _, _ = self._qwen4_ple_offload_status(entry, settings)
+            add("qwen4_ple_ssd_offload", qwen4_offload)
 
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)
@@ -2461,6 +2516,7 @@ class EnginePool:
             model_settings = runtime_settings
             if model_settings is None and self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
+            model_settings = self._effective_qwen4_model_settings(entry, model_settings)
 
             deployment = self._distributed_deployment_for_entry(entry)
             base_resident_size = self._entry_resident_size(entry)

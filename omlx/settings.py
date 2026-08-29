@@ -176,6 +176,15 @@ class ServerSettings:
     burst_decode_mode: str = DEFAULT_BURST_DECODE_MODE
     preserve_mid_system_cache: bool = True
     distributed_inference_enabled: bool = False
+    # Human-readable size, same grammar as cache limits ("100MB", "1GB").
+    max_audio_upload_size: str = "100MB"
+
+    def max_audio_upload_bytes(self) -> int:
+        """Configured audio upload limit in bytes. Non-positive sizes raise ValueError."""
+        size = parse_size(self.max_audio_upload_size)
+        if size <= 0:
+            raise ValueError("max_audio_upload_size must be positive")
+        return size
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -199,6 +208,7 @@ class ServerSettings:
                 "distributed_inference_enabled",
                 False,
             ),
+            max_audio_upload_size=data.get("max_audio_upload_size", "100MB"),
         )
 
 
@@ -1087,6 +1097,8 @@ class GlobalSettings:
             self.server.preserve_mid_system_cache = (
                 preserve_mid_system_cache.strip().lower() in {"1", "true", "yes", "on"}
             )
+        if max_audio_upload_size := os.getenv("OMLX_MAX_AUDIO_UPLOAD_SIZE"):
+            self.server.max_audio_upload_size = max_audio_upload_size
 
         # Model settings
         if model_dir := os.getenv("OMLX_MODEL_DIR"):
@@ -1224,6 +1236,11 @@ class GlobalSettings:
             self.server.log_level = args.log_level
         if hasattr(args, "sse_keepalive_mode") and args.sse_keepalive_mode is not None:
             self.server.sse_keepalive_mode = args.sse_keepalive_mode
+        if (
+            hasattr(args, "max_audio_upload_size")
+            and args.max_audio_upload_size is not None
+        ):
+            self.server.max_audio_upload_size = args.max_audio_upload_size
 
         # Model settings
         if hasattr(args, "model_dir") and args.model_dir is not None:
@@ -1486,6 +1503,13 @@ class GlobalSettings:
                 f"Invalid sse_keepalive_mode: {self.server.sse_keepalive_mode} "
                 f"(must be one of {valid_keepalive_modes})"
             )
+
+        try:
+            audio_upload_size = parse_size(self.server.max_audio_upload_size)
+            if audio_upload_size <= 0:
+                errors.append("max_audio_upload_size must be positive")
+        except (AttributeError, TypeError, ValueError) as e:
+            errors.append(f"Invalid max_audio_upload_size: {e}")
 
         # Memory guard tier validation
         if self.memory.memory_guard_tier not in VALID_MEMORY_GUARD_TIERS:

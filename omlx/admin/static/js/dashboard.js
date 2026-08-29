@@ -121,7 +121,7 @@
             // Global settings
             globalSettings: {
                 base_path: '',
-                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, distributed_inference_enabled: false, distributed_inference_active: false },
+                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
@@ -6678,6 +6678,7 @@
                 const s = this.globalSettings;
                 if (!s.server.host) errors.push('Host');
                 if (!s.server.port) errors.push('Port');
+                if (!s.server.max_audio_upload_size) errors.push('Maximum Audio Upload Size');
                 if (!s.model.model_dirs || !s.model.model_dirs.some(d => d.trim())) errors.push('Model Directory');
                 if (!s.scheduler.max_concurrent_requests) errors.push('Max Concurrent Requests');
                 if (!s.scheduler.embedding_batch_size) errors.push('Embedding Batch Size');
@@ -6720,6 +6721,7 @@
                             burst_decode_mode: this.globalSettings.server.burst_decode_mode,
                             preserve_mid_system_cache: this.globalSettings.server.preserve_mid_system_cache,
                             distributed_inference_enabled: this.globalSettings.server.distributed_inference_enabled,
+                            max_audio_upload_size: this.globalSettings.server.max_audio_upload_size,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
                             model_fallback: this.globalSettings.model.model_fallback,
                             hide_helper_models: this.globalSettings.model.hide_helper_models,
@@ -7383,6 +7385,12 @@
                     force_sampling: s.force_sampling || false,
                     enable_thinking: s.enable_thinking ?? null,
                     thinking_default: model?.thinking_default ?? null,
+                    qwen4_ple_ssd_offload: model?.qwen4_ple_ssd_offload_forced === true
+                        || s.qwen4_ple_ssd_offload === true,
+                    qwen4_ple_ssd_offload_supported:
+                        model?.qwen4_ple_ssd_offload_supported === true,
+                    qwen4_ple_ssd_offload_forced:
+                        model?.qwen4_ple_ssd_offload_forced === true,
                     enableThinkingBudget: !!(s.thinking_budget_tokens),
                     thinking_budget_tokens: s.thinking_budget_tokens || null,
                     guided_grammar_enabled: s.guided_grammar_enabled || false,
@@ -8303,6 +8311,8 @@
                                     ? (this.modelSettings.index_cache_freq || 4)
                                     : 0,
                                 enable_thinking: this.modelSettings.enable_thinking,
+                                qwen4_ple_ssd_offload:
+                                    !!this.modelSettings.qwen4_ple_ssd_offload,
                                 thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
                                 thinking_budget_tokens: this.modelSettings.enableThinkingBudget
                                     ? (this.modelSettings.thinking_budget_tokens || null)
